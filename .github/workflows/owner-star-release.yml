@@ -1,0 +1,45 @@
+name: Owner Star Release
+
+on:
+  watch:
+    types:
+      - started
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release when repository owner stars
+    if: github.event.sender.login == github.repository_owner
+    runs-on: windows-latest
+
+    env:
+      RELEASE_TAG: v0.1.${{ github.run_number }}
+      RELEASE_NAME: docintel-md v0.1.${{ github.run_number }}
+      ARTIFACT_NAME: docintel-md-windows-x64.exe
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare release artifact
+        shell: pwsh
+        run: |
+          Copy-Item -Path target\release\docintel-md.exe -Destination $env:ARTIFACT_NAME
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create $env:RELEASE_TAG `
+            $env:ARTIFACT_NAME `
+            --title $env:RELEASE_NAME `
+            --notes "由仓库主人点 Star 自动发布。取消 Star 不会触发本流程。"
