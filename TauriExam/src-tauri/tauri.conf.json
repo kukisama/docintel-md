@@ -26,6 +26,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": ["resources/pdfium.dll"],
     "icon": ["icons/icon.ico"]
   }
 }

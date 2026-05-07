@@ -1,17 +1,55 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
+  AiQuestionRequest,
+  AiResponseResult,
+  AiSettings,
+  AiStreamEvent,
+  AppPaths,
+  BankHealth,
   BankInfo,
   ExamAnswerDetail,
   ExamSessionSummary,
   PageImage,
   QuestionDetail,
+  QuestionFlag,
   QuestionSummary,
+  InteractionModel,
+  ReviewMode,
   SaveExamInput,
   SavedExam,
+  SetQuestionFlagInput,
+  TranslateQuestionInput,
+  TranslationRow,
+  TranslatorTestResult,
 } from './types';
 
 export const api = {
   listBanks: () => invoke<BankInfo[]>('list_banks'),
+  refreshBanks: () => invoke<BankInfo[]>('refresh_banks'),
+  getAppPaths: () => invoke<AppPaths>('get_app_paths'),
+  openDataDir: () => invoke<void>('open_data_dir'),
+  openQuestionBanksDir: () => invoke<void>('open_question_banks_dir'),
+  checkBankHealth: (bankId: string) => invoke<BankHealth>('check_bank_health', { bankId }),
+  listQuestionFlags: (bankId: string) => invoke<QuestionFlag[]>('list_question_flags', { bankId }),
+  setQuestionFlag: (input: SetQuestionFlagInput) => invoke<QuestionFlag[]>('set_question_flag', { input }),
+  listReviewQuestions: (bankId: string, reviewMode: ReviewMode) =>
+    invoke<QuestionSummary[]>('list_review_questions', { bankId, reviewMode }),
+  getInteractionModel: (bankId: string, questionId: string) =>
+    invoke<InteractionModel>('get_interaction_model', { bankId, questionId }),
+  getAiSettings: () => invoke<AiSettings>('get_ai_settings'),
+  saveAiSettings: (settings: AiSettings) => invoke<AiSettings>('save_ai_settings', { settings }),
+  testTranslatorSettings: (settings: AiSettings) => invoke<TranslatorTestResult>('test_translator_settings', { settings }),
+  askAiAboutQuestion: (input: AiQuestionRequest) => invoke<AiResponseResult>('ask_ai_about_question', { input }),
+  createAiStreamChannel: (onMessage: (event: AiStreamEvent) => void) => {
+    const channel = new Channel<AiStreamEvent>();
+    channel.onmessage = onMessage;
+    return channel;
+  },
+  askAiAboutQuestionStream: (input: AiQuestionRequest, onEvent: Channel<AiStreamEvent>) =>
+    invoke<AiResponseResult>('ask_ai_about_question_stream', { input, onEvent }),
+  getCachedTranslations: (bankId: string, questionId: string, language: string) =>
+    invoke<TranslationRow[]>('get_cached_translations', { bankId, questionId, language }),
+  translateQuestion: (input: TranslateQuestionInput) => invoke<TranslationRow[]>('translate_question', { input }),
   listQuestions: (bankId: string) => invoke<QuestionSummary[]>('list_questions', { bankId }),
   getQuestion: (bankId: string, questionId: string) =>
     invoke<QuestionDetail>('get_question', { bankId, questionId }),

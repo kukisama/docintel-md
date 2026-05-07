@@ -2,12 +2,23 @@
 
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
+use pdfium_render::prelude::*;
+use reqwest::blocking::Client;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use tauri::ipc::Channel;
 use uuid::Uuid;
+
+const APP_DIR_NAME: &str = "TauriExam";
+static PDF_RENDER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 struct BankInfo {
@@ -17,6 +28,28 @@ struct BankInfo {
     db_path: String,
     pdf_path: String,
     question_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct AppPaths {
+    data_dir: String,
+    app_db_path: String,
+    question_banks_dir: String,
+    page_cache_dir: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BankHealth {
+    bank_id: String,
+    sqlite_ok: bool,
+    pdf_found: bool,
+    question_count: i64,
+    empty_question_count: i64,
+    empty_answer_count: i64,
+    missing_page_count: i64,
+    max_question_page: Option<i64>,
+    pdf_page_count: Option<i64>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +180,128 @@ struct ExamAnswerDetail {
     created_at: String,
 }
 
+#[derive(Debug, Serialize)]
+struct QuestionFlagRow {
+    bank_id: String,
+    question_id: String,
+    flag_type: String,
+    note: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetQuestionFlagInput {
+    bank_id: String,
+    question_id: String,
+    flag_type: String,
+    enabled: bool,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InteractionOption {
+    key: String,
+    text: String,
+    group: Option<String>,
+    is_distractor: bool,
+    sort_order: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct InteractionRow {
+    id: String,
+    prompt: String,
+    option_group: Option<String>,
+    correct_selection: Option<String>,
+    sort_order: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct InteractionSlot {
+    id: String,
+    label: String,
+    correct_option: Option<String>,
+    sort_order: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct InteractionModel {
+    kind: String,
+    can_auto_grade: bool,
+    message: String,
+    options: Vec<InteractionOption>,
+    rows: Vec<InteractionRow>,
+    slots: Vec<InteractionSlot>,
+    answer_key: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AiSettings {
+    enabled: bool,
+    base_url: String,
+    api_version: String,
+    api_key: String,
+    model: String,
+    temperature: f32,
+    translation_provider: String,
+    translator_endpoint: String,
+    translator_key: String,
+    translator_region: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AiQuestionRequest {
+    bank_id: String,
+    question_id: String,
+    user_prompt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AiResponseResult {
+    content: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AiStreamEvent {
+    question_id: String,
+    delta: String,
+    done: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TranslateQuestionInput {
+    bank_id: String,
+    question_id: String,
+    language: String,
+    force: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TranslationRow {
+    field_name: String,
+    segment_index: i64,
+    source_hash: String,
+    language: String,
+    translated_text: String,
+    provider: String,
+    model: String,
+    version: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct TranslatorTestResult {
+    source_text: String,
+    translated_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct TranslationSegment {
+    field_name: String,
+    segment_index: i64,
+    source_text: String,
+}
+
 fn workspace_root() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
     for dir in cwd.ancestors() {
@@ -166,15 +321,107 @@ fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
-fn question_bank_roots() -> Result<Vec<PathBuf>, String> {
+fn app_data_dir() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("LOCALAPPDATA") {
+        return Ok(PathBuf::from(path).join(APP_DIR_NAME));
+    }
+    Ok(workspace_root()?.join("output/exam-tool"))
+}
+
+fn question_banks_dir() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join("question-banks"))
+}
+
+fn page_cache_dir() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join("cache/pages"))
+}
+
+fn legacy_question_bank_roots() -> Result<Vec<PathBuf>, String> {
     let mut roots = Vec::new();
     if let Some(dir) = exe_dir() {
         roots.push(dir.join("question-banks"));
     }
     roots.push(std::env::current_dir().map_err(|err| err.to_string())?.join("question-banks"));
+    roots.push(workspace_root()?.join("TauriExam/question-banks"));
     roots.push(workspace_root()?.join("question-banks"));
     roots.dedup();
     Ok(roots)
+}
+
+fn has_bank_files(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| is_supported_sqlite(&entry.path()))
+}
+
+fn migrate_question_bank_files(target: &Path) -> Result<(), String> {
+    if has_bank_files(target) {
+        return Ok(());
+    }
+    for root in legacy_question_bank_roots()? {
+        if root == target || !has_bank_files(&root) {
+            continue;
+        }
+        fs::create_dir_all(target).map_err(|err| err.to_string())?;
+        for entry in fs::read_dir(&root).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let source = entry.path();
+            let is_bank_asset = is_supported_sqlite(&source)
+                || source.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("pdf")).unwrap_or(false);
+            if !is_bank_asset {
+                continue;
+            }
+            let Some(file_name) = source.file_name() else {
+                continue;
+            };
+            let destination = target.join(file_name);
+            if !destination.exists() {
+                fs::copy(&source, &destination).map_err(|err| err.to_string())?;
+            }
+        }
+        break;
+    }
+    Ok(())
+}
+
+fn ensure_app_dirs() -> Result<(), String> {
+    let data_dir = app_data_dir()?;
+    fs::create_dir_all(data_dir.join("logs")).map_err(|err| err.to_string())?;
+    fs::create_dir_all(data_dir.join("backups")).map_err(|err| err.to_string())?;
+    fs::create_dir_all(page_cache_dir()?).map_err(|err| err.to_string())?;
+    let bank_dir = question_banks_dir()?;
+    fs::create_dir_all(&bank_dir).map_err(|err| err.to_string())?;
+    migrate_question_bank_files(&bank_dir)?;
+    migrate_app_db()?;
+    Ok(())
+}
+
+fn migrate_app_db() -> Result<(), String> {
+    let new_path = app_data_dir()?.join("app.sqlite");
+    if new_path.exists() {
+        return Ok(());
+    }
+    let old_path = workspace_root()?.join("output/exam-tool/exam-tool.sqlite");
+    if old_path.exists() {
+        if let Some(parent) = new_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        fs::copy(old_path, new_path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn question_bank_roots() -> Result<Vec<PathBuf>, String> {
+    ensure_app_dirs()?;
+    Ok(vec![question_banks_dir()?])
+}
+
+fn is_supported_sqlite(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ["sqlite", "sqlite3", "db"].iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+        .unwrap_or(false)
 }
 
 fn normalize_bank_id(value: &str) -> String {
@@ -205,6 +452,443 @@ fn sqlite_has_questions(path: &Path) -> bool {
     .unwrap_or(false)
 }
 
+fn table_exists(conn: &Connection, table_name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table_name],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+    .unwrap_or(false)
+}
+
+fn hash_text(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    conn.query_row("SELECT value FROM app_settings WHERE key = ?1", params![key], |row| row.get(0))
+        .map(Some)
+        .or_else(|err| {
+            if matches!(err, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(None)
+            } else {
+                Err(err.to_string())
+            }
+        })
+}
+
+fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r#"
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        "#,
+        params![key, value, now],
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+fn default_ai_settings() -> AiSettings {
+    AiSettings {
+        enabled: false,
+        base_url: "https://api.openai.com/v1".to_string(),
+        api_version: String::new(),
+        api_key: String::new(),
+        model: "gpt-4.1-mini".to_string(),
+        temperature: 0.7,
+        translation_provider: "ai".to_string(),
+        translator_endpoint: "https://api.cognitive.microsofttranslator.com".to_string(),
+        translator_key: String::new(),
+        translator_region: String::new(),
+    }
+}
+
+fn load_ai_settings() -> Result<AiSettings, String> {
+    let conn = open_app_db()?;
+    let defaults = default_ai_settings();
+    let mut settings = AiSettings {
+        enabled: get_setting(&conn, "ai.enabled")?.map(|value| value == "true").unwrap_or(defaults.enabled),
+        base_url: get_setting(&conn, "ai.base_url")?.unwrap_or(defaults.base_url),
+        api_version: get_setting(&conn, "ai.api_version")?.unwrap_or(defaults.api_version),
+        api_key: get_setting(&conn, "ai.api_key")?.unwrap_or(defaults.api_key),
+        model: get_setting(&conn, "ai.model")?.unwrap_or(defaults.model),
+        temperature: get_setting(&conn, "ai.temperature")?
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(defaults.temperature),
+        translation_provider: get_setting(&conn, "translation.provider")?.unwrap_or(defaults.translation_provider),
+        translator_endpoint: get_setting(&conn, "translator.endpoint")?.unwrap_or(defaults.translator_endpoint),
+        translator_key: get_setting(&conn, "translator.key")?.unwrap_or(defaults.translator_key),
+        translator_region: get_setting(&conn, "translator.region")?.unwrap_or(defaults.translator_region),
+    };
+    if settings.api_version.trim().is_empty() {
+        settings.api_version = effective_ai_api_version(&settings);
+    }
+    Ok(settings)
+}
+
+fn question_context(question: &QuestionDetail) -> String {
+    let options = question
+        .options
+        .iter()
+        .map(|option| format!("{}. {}", option.option_key, option.option_text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let answer_areas = question
+        .answer_areas
+        .iter()
+        .map(|row| format!("{} => {}", row.prompt, row.recommended_selection))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "题型: {}\nTopic: {}\n页码: {}\n\n题干:\n{}\n\n选项:\n{}\n\n答案区:\n{}\n\n源答案: {}\n推荐答案: {}\n中文判断: {}\nReasoning:\n{}\nNotes:\n{}",
+        question.question_type,
+        question.topic.clone().unwrap_or_default(),
+        question.source_pages.clone().unwrap_or_default(),
+        question.question_text,
+        options,
+        answer_areas,
+        question.source_answer.clone().unwrap_or_default(),
+        question.recommended_answer.clone().unwrap_or_default(),
+        question.chinese_judgement.clone().unwrap_or_default(),
+        question.reasoning.clone().unwrap_or_default(),
+        question.notes.clone().unwrap_or_default()
+    )
+}
+
+fn call_responses_api(settings: &AiSettings, prompt: &str) -> Result<String, String> {
+    if !settings.enabled {
+        return Err("AI 未启用，请先在控制面板启用 AI。".to_string());
+    }
+    if settings.api_key.trim().is_empty() {
+        return Err("AI API Key 为空，请先在控制面板填写。".to_string());
+    }
+    let api_version = effective_ai_api_version(settings);
+    let url = if api_version.is_empty() {
+        format!("{}/responses", settings.base_url.trim_end_matches('/'))
+    } else {
+        format!(
+            "{}/responses?api-version={}",
+            settings.base_url.trim_end_matches('/'),
+            api_version
+        )
+    };
+    let client = http_client()?;
+    let mut request = client
+        .post(url)
+        .json(&json!({
+            "model": settings.model,
+            "temperature": settings.temperature,
+            "input": prompt
+        }));
+    request = if api_version.is_empty() {
+        request.bearer_auth(settings.api_key.trim())
+    } else {
+        request.header("api-key", settings.api_key.trim())
+    };
+    let response = request
+        .send()
+        .map_err(request_error_message)?;
+    let status = response.status();
+    let body: Value = response.json().map_err(|err| err.to_string())?;
+    if !status.is_success() {
+        return Err(format!("AI 请求失败 ({status}): {body}"));
+    }
+    extract_response_text(&body).ok_or_else(|| format!("AI 响应中未找到文本内容: {body}"))
+}
+
+fn call_responses_api_stream<F>(settings: &AiSettings, prompt: &str, mut on_delta: F) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    if !settings.enabled {
+        return Err("AI 未启用，请先在控制面板启用 AI。".to_string());
+    }
+    if settings.api_key.trim().is_empty() {
+        return Err("AI API Key 为空，请先在控制面板填写。".to_string());
+    }
+    let api_version = effective_ai_api_version(settings);
+    let url = if api_version.is_empty() {
+        format!("{}/responses", settings.base_url.trim_end_matches('/'))
+    } else {
+        format!(
+            "{}/responses?api-version={}",
+            settings.base_url.trim_end_matches('/'),
+            api_version
+        )
+    };
+    let client = http_client()?;
+    let mut request = client
+        .post(url)
+        .header("Accept", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .json(&json!({
+            "model": settings.model,
+            "temperature": settings.temperature,
+            "input": prompt,
+            "stream": true
+        }));
+    request = if api_version.is_empty() {
+        request.bearer_auth(settings.api_key.trim())
+    } else {
+        request.header("api-key", settings.api_key.trim())
+    };
+    let response = request.send().map_err(request_error_message)?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(format!("AI 请求失败 ({status}): {body}"));
+    }
+    let mut content = String::new();
+    let reader = BufReader::new(response);
+    for line in reader.lines() {
+        let line = line.map_err(|err| err.to_string())?;
+        let Some(data) = line.strip_prefix("data:") else {
+            if content.is_empty() {
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    if let Some(text) = extract_response_text(&value) {
+                        content.push_str(&text);
+                        on_delta(&text)?;
+                    }
+                }
+            }
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(data) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if let Some(delta) = extract_stream_delta(&value) {
+            content.push_str(&delta);
+            on_delta(&delta)?;
+        }
+    }
+    Ok(content)
+}
+
+fn http_client() -> Result<Client, String> {
+    Client::builder()
+        .use_native_tls()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|err| err.to_string())
+}
+
+fn request_error_message(err: reqwest::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(err) = source {
+        message.push_str("; caused by: ");
+        message.push_str(&err.to_string());
+        source = err.source();
+    }
+    message
+}
+
+fn extract_stream_delta(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) == Some("response.output_text.delta") {
+        return value.get("delta").and_then(Value::as_str).map(str::to_string);
+    }
+    value.get("delta").and_then(Value::as_str).map(str::to_string)
+}
+
+fn effective_ai_api_version(settings: &AiSettings) -> String {
+    let configured = settings.api_version.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    let base_url = settings.base_url.to_lowercase();
+    if (base_url.contains("azure-api.net") || base_url.contains(".openai.azure.com")) && !base_url.contains("/v1") {
+        return "2025-03-01-preview".to_string();
+    }
+    String::new()
+}
+
+fn extract_response_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let mut parts = Vec::new();
+    if let Some(output) = value.get("output").and_then(Value::as_array) {
+        for item in output {
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for part in content {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn translator_language(language: &str) -> String {
+    match language.trim().to_lowercase().as_str() {
+        "zh-cn" | "zh_cn" | "zh" => "zh-Hans".to_string(),
+        "zh-tw" | "zh_tw" | "zh-hk" | "zh_hk" => "zh-Hant".to_string(),
+        value if value.is_empty() => "zh-Hans".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn call_translator_batch_api(settings: &AiSettings, segments: &[TranslationSegment], language: &str) -> Result<Vec<String>, String> {
+    if settings.translator_key.trim().is_empty() {
+        return Err("Microsoft Translator Key 为空，请先在控制面板填写。".to_string());
+    }
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target = translator_language(language);
+    let translator_region = translator_region_for_config(settings)?;
+    let url = translator_url_with_target("https://api.cognitive.microsofttranslator.com/translate", &target);
+    let client = Client::builder().build().map_err(|err| err.to_string())?;
+    let body = segments
+        .iter()
+        .map(|segment| json!({ "Text": segment.source_text }))
+        .collect::<Vec<_>>();
+    let response = client
+        .post(&url)
+        .header("Ocp-Apim-Subscription-Key", settings.translator_key.trim())
+        .header("Ocp-Apim-Subscription-Region", translator_region)
+        .header("Content-Type", "application/json; charset=UTF-8")
+        .json(&body)
+        .send()
+        .map_err(|err| err.to_string())?;
+    let status = response.status();
+    let response_text = response.text().map_err(|err| err.to_string())?;
+    let response_body: Value = serde_json::from_str(&response_text)
+        .map_err(|err| format!("Microsoft Translator 响应不是合法 JSON ({status}): {err}; 原文: {response_text}"))?;
+    if !status.is_success() {
+        return Err(format!("Microsoft Translator 请求失败 ({status})，endpoint 必须填写类似 https://southeastasia.api.cognitive.microsoft.com，region 必须是 southeastasia。响应: {response_body}"));
+    }
+    parse_translator_response(&response_body)
+}
+
+fn translator_url_with_target(base: &str, target: &str) -> String {
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let mut url = format!("{base}{separator}");
+    if !base.to_lowercase().contains("api-version=") {
+        url.push_str("api-version=3.0&");
+    }
+    url.push_str("to=");
+    url.push_str(target);
+    url
+}
+
+fn translator_region_for_config(settings: &AiSettings) -> Result<String, String> {
+    let endpoint_region = translator_region_from_endpoint(&settings.translator_endpoint);
+    let region = if settings.translator_region.trim().is_empty() {
+        endpoint_region.as_deref().unwrap_or_default()
+    } else {
+        settings.translator_region.trim()
+    };
+    if region.is_empty() {
+        return Err("Microsoft Translator Region 为空；当前只支持类似 https://southeastasia.api.cognitive.microsoft.com + southeastasia 的配置。".to_string());
+    }
+    if translator_region_from_endpoint(&settings.translator_endpoint).is_none() {
+        return Err("Microsoft Translator Endpoint 格式不支持；当前只支持类似 https://southeastasia.api.cognitive.microsoft.com 的区域 Cognitive endpoint。".to_string());
+    }
+    Ok(region.to_string())
+}
+
+fn translator_region_from_endpoint(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim().trim_start_matches("https://").trim_start_matches("http://");
+    let host = endpoint.split('/').next().unwrap_or_default().to_lowercase();
+    host.strip_suffix(".api.cognitive.microsoft.com")
+        .filter(|region| !region.is_empty())
+        .map(ToString::to_string)
+}
+
+fn parse_translator_response(body: &Value) -> Result<Vec<String>, String> {
+    let items = body.as_array().ok_or_else(|| format!("Microsoft Translator 响应不是数组: {body}"))?;
+    let mut translations = Vec::new();
+    for item in items {
+        let text = item
+            .get("translations")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|translation| translation.get("text"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Microsoft Translator 响应中未找到译文: {body}"))?;
+        translations.push(text.to_string());
+    }
+    Ok(translations)
+}
+
+fn sanitized_translator_url_path(url: &str) -> String {
+    let without_scheme = url.split_once("://").map(|(_, right)| right).unwrap_or(url);
+    let (host, path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let host_label = if host.eq_ignore_ascii_case("api.cognitive.microsofttranslator.com") {
+        "global-translator"
+    } else if host.ends_with(".api.cognitive.microsoft.com") {
+        "regional-cognitive"
+    } else if host.ends_with(".cognitiveservices.azure.com") {
+        "custom-cognitiveservices"
+    } else {
+        "configured-endpoint"
+    };
+    format!("{host_label}/{path}")
+}
+
+fn call_ai_translation_api(settings: &AiSettings, segments: &[TranslationSegment], language: &str) -> Result<Vec<String>, String> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let items = segments
+        .iter()
+        .map(|segment| json!({
+            "field_name": segment.field_name,
+            "segment_index": segment.segment_index,
+            "text": segment.source_text
+        }))
+        .collect::<Vec<_>>();
+    let prompt = format!(
+        "请把下面考试题页面的结构化 JSON 翻译成 {language}。要求：\n1. 必须只输出 JSON，不要 Markdown，不要解释。\n2. JSON 顶层必须是数组。\n3. 每个元素必须保留 field_name 和 segment_index 原值，并输出 translated_text。\n4. 保留 Microsoft 产品名、考试术语、选项字母、URL、代码、专有名词；不要改答案字母。\n5. 不要遗漏任何元素，输出顺序与输入一致。\n\n输入 JSON：\n{}",
+        serde_json::to_string(&items).map_err(|err| err.to_string())?
+    );
+    let content = call_responses_api(settings, &prompt)?;
+    parse_ai_translation_json(&content, segments.len())
+}
+
+fn parse_ai_translation_json(content: &str, expected_len: usize) -> Result<Vec<String>, String> {
+    let trimmed = content.trim();
+    let json_text = if trimmed.starts_with("```") {
+        trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+    } else {
+        trimmed
+    };
+    let value: Value = serde_json::from_str(json_text).map_err(|err| format!("AI 翻译结果不是合法 JSON: {err}; 原文: {content}"))?;
+    let items = value.as_array().ok_or_else(|| format!("AI 翻译结果顶层不是数组: {value}"))?;
+    if items.len() != expected_len {
+        return Err(format!("AI 翻译结果数量不匹配：期望 {expected_len}，实际 {}。", items.len()));
+    }
+    items
+        .iter()
+        .map(|item| {
+            item.get("translated_text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("AI 翻译结果缺少 translated_text: {item}"))
+        })
+        .collect()
+}
+
 fn discover_banks() -> Result<Vec<BankEntry>, String> {
     let mut banks = Vec::new();
     for root in question_bank_roots()? {
@@ -214,7 +898,7 @@ fn discover_banks() -> Result<Vec<BankEntry>, String> {
         for entry in entries {
             let entry = entry.map_err(|err| err.to_string())?;
             let db_path = entry.path();
-            if db_path.extension().and_then(|ext| ext.to_str()).map(|ext| !ext.eq_ignore_ascii_case("sqlite")).unwrap_or(true) {
+            if !is_supported_sqlite(&db_path) {
                 continue;
             }
             if !sqlite_has_questions(&db_path) {
@@ -238,7 +922,7 @@ fn discover_banks() -> Result<Vec<BankEntry>, String> {
                 name: format!("{stem} 题库"),
                 db_path: db_path.clone(),
                 pdf_path: pdf_path.exists().then_some(pdf_path),
-                cache_dir: root.join(".page-cache").join(normalize_bank_id(stem)),
+                cache_dir: page_cache_dir()?.join(normalize_bank_id(stem)),
                 question_count,
             });
         }
@@ -259,7 +943,8 @@ fn bank_db_path(bank_id: &str) -> Result<PathBuf, String> {
 }
 
 fn app_db_path() -> Result<PathBuf, String> {
-    Ok(workspace_root()?.join("output/exam-tool/exam-tool.sqlite"))
+    ensure_app_dirs()?;
+    Ok(app_data_dir()?.join("app.sqlite"))
 }
 
 fn open_bank(bank_id: &str) -> Result<Connection, String> {
@@ -345,9 +1030,150 @@ fn init_app_schema(conn: &Connection) -> Result<(), String> {
           updated_at TEXT NOT NULL,
           UNIQUE(bank_id, question_id, field_name, language, source_hash)
         );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+                CREATE TABLE IF NOT EXISTS ai_conversations (
+                    id TEXT PRIMARY KEY,
+                    bank_id TEXT NOT NULL,
+                    question_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_messages (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES ai_conversations(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS translation_segments (
+                    id TEXT PRIMARY KEY,
+                    bank_id TEXT NOT NULL,
+                    question_id TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    segment_index INTEGER NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    translated_text TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
         "#,
     )
     .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn get_app_paths() -> Result<AppPaths, String> {
+    ensure_app_dirs()?;
+    Ok(AppPaths {
+        data_dir: app_data_dir()?.display().to_string(),
+        app_db_path: app_db_path()?.display().to_string(),
+        question_banks_dir: question_banks_dir()?.display().to_string(),
+        page_cache_dir: page_cache_dir()?.display().to_string(),
+    })
+}
+
+#[tauri::command]
+fn refresh_banks() -> Result<Vec<BankInfo>, String> {
+    list_banks()
+}
+
+#[tauri::command]
+fn open_data_dir() -> Result<(), String> {
+    ensure_app_dirs()?;
+    open_dir(&app_data_dir()?)
+}
+
+#[tauri::command]
+fn open_question_banks_dir() -> Result<(), String> {
+    ensure_app_dirs()?;
+    open_dir(&question_banks_dir()?)
+}
+
+#[tauri::command]
+fn check_bank_health(bank_id: String) -> Result<BankHealth, String> {
+    let bank = find_bank(&bank_id)?;
+    let conn = Connection::open(&bank.db_path).map_err(|err| err.to_string())?;
+    let question_count = conn.query_row("SELECT COUNT(*) FROM questions", [], |row| row.get(0)).unwrap_or(0);
+    let empty_question_count = conn
+        .query_row("SELECT COUNT(*) FROM questions WHERE trim(coalesce(question_text, '')) = ''", [], |row| row.get(0))
+        .unwrap_or(0);
+    let empty_answer_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM questions WHERE trim(coalesce(source_answer, '')) = '' AND trim(coalesce(recommended_answer, '')) = ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let missing_page_count = conn
+        .query_row("SELECT COUNT(*) FROM questions WHERE page_from IS NULL OR page_to IS NULL", [], |row| row.get(0))
+        .unwrap_or(0);
+    let max_question_page = conn.query_row("SELECT max(page_to) FROM questions", [], |row| row.get(0)).unwrap_or(None);
+
+    let mut warnings = Vec::new();
+    if bank.pdf_path.is_none() {
+        warnings.push("未找到同名 PDF，可以继续刷题，但无法加载原文页。".to_string());
+    }
+    if empty_question_count > 0 {
+        warnings.push(format!("发现 {empty_question_count} 道题题干为空。"));
+    }
+    if empty_answer_count > 0 {
+        warnings.push(format!("发现 {empty_answer_count} 道题缺少源答案和推荐答案。"));
+    }
+    if missing_page_count > 0 {
+        warnings.push(format!("发现 {missing_page_count} 道题缺少 PDF 页码。"));
+    }
+    if warnings.is_empty() {
+        warnings.push("题库基础检查通过。".to_string());
+    }
+
+    Ok(BankHealth {
+        bank_id,
+        sqlite_ok: true,
+        pdf_found: bank.pdf_path.is_some(),
+        question_count,
+        empty_question_count,
+        empty_answer_count,
+        missing_page_count,
+        max_question_page,
+        pdf_page_count: None,
+        warnings,
+    })
+}
+
+fn open_dir(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        Command::new("explorer").arg(path).spawn().map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(path).spawn().map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(path).spawn().map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err("Unsupported platform for opening directories.".to_string())
 }
 
 #[tauri::command]
@@ -523,41 +1349,70 @@ fn ensure_page_image(bank: &BankEntry, page: i64) -> Result<PathBuf, String> {
     if bank.pdf_path.is_none() {
         return Err(format!("No matching PDF found for bank {}. Put {}.pdf next to the SQLite file.", bank.name, bank.exam_code));
     }
-    Err(format!("Failed to render PDF page {page}. Install Python with PyMuPDF for on-demand rendering, or pre-cache the page image."))
+    Err(format!("Failed to render PDF page {page}. PDFium runtime was not available or the page could not be rendered."))
 }
 
 fn render_pdf_page(pdf_path: &Path, page: i64, output_path: &Path) -> Result<(), String> {
-    let script = r#"
-import sys
-from pathlib import Path
-import fitz
-pdf = Path(sys.argv[1])
-page = int(sys.argv[2])
-out = Path(sys.argv[3])
-out.parent.mkdir(parents=True, exist_ok=True)
-doc = fitz.open(str(pdf))
-pix = doc.load_page(page - 1).get_pixmap(matrix=fitz.Matrix(1.6, 1.6), alpha=False)
-pix.save(str(out))
-"#;
-    let mut errors = Vec::new();
-    for program in ["py", "python", "python3"] {
-        let mut command = Command::new(program);
-        if program == "py" {
-            command.arg("-3");
-        }
-        command.args(["-c", script, &pdf_path.display().to_string(), &page.to_string(), &output_path.display().to_string()]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        match command.output() {
-            Ok(output) if output.status.success() => return Ok(()),
-            Ok(output) => errors.push(format!("{program}: {}", String::from_utf8_lossy(&output.stderr).trim())),
-            Err(err) => errors.push(format!("{program}: {err}")),
+    let _guard = PDF_RENDER_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "PDF 渲染锁已损坏，请重启应用后再试。".to_string())?;
+    if output_path.exists() {
+        return Ok(());
+    }
+    render_pdf_page_native(pdf_path, page, output_path)
+}
+
+fn render_pdf_page_native(pdf_path: &Path, page: i64, output_path: &Path) -> Result<(), String> {
+    if page <= 0 {
+        return Err("PDF page number must start from 1.".to_string());
+    }
+    let pdfium = bind_pdfium_safely()?;
+    let document = pdfium.load_pdf_from_file(pdf_path, None).map_err(|err| err.to_string())?;
+    let page_index = i32::try_from(page - 1).map_err(|_| "PDF page index is too large.".to_string())?;
+    let pdf_page = document.pages().get(page_index).map_err(|err| err.to_string())?;
+    let render_config = PdfRenderConfig::new().set_target_width(1600).set_maximum_height(2400);
+    let image = pdf_page
+        .render_with_config(&render_config)
+        .map_err(|err| err.to_string())?
+        .as_image()
+        .map_err(|err| err.to_string())?
+        .into_rgb8();
+    image.save(output_path).map_err(|err| err.to_string())
+}
+
+fn bind_pdfium_safely() -> Result<Pdfium, String> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = exe_dir() {
+        candidates.push(Pdfium::pdfium_platform_library_name_at_path(&dir));
+        candidates.push(dir.join("resources").join(Pdfium::pdfium_platform_library_name()));
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.join("resources").join(Pdfium::pdfium_platform_library_name()));
         }
     }
-    Err(errors.join("; "))
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(Pdfium::pdfium_platform_library_name_at_path(&cwd));
+        candidates.push(cwd.join("resources").join(Pdfium::pdfium_platform_library_name()));
+        candidates.push(cwd.join("src-tauri").join("resources").join(Pdfium::pdfium_platform_library_name()));
+    }
+
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        match Pdfium::bind_to_library(&candidate) {
+            Ok(bindings) => return Ok(Pdfium::new(bindings)),
+            Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => return Ok(Pdfium::default()),
+            Err(err) => errors.push(format!("{}: {err}", candidate.display())),
+        }
+    }
+
+    match Pdfium::bind_to_system_library() {
+        Ok(bindings) => Ok(Pdfium::new(bindings)),
+        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Ok(Pdfium::default()),
+        Err(err) => {
+            errors.push(format!("system library: {err}"));
+            Err(errors.join("; "))
+        }
+    }
 }
 
 fn find_page_image(root: &Path, page: i64) -> Result<Option<PathBuf>, String> {
@@ -704,17 +1559,681 @@ fn list_exam_answers(session_id: String) -> Result<Vec<ExamAnswerDetail>, String
     Ok(answers)
 }
 
+#[tauri::command]
+fn list_question_flags(bank_id: String) -> Result<Vec<QuestionFlagRow>, String> {
+    let conn = open_app_db()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT bank_id, question_id, flag_type, note, updated_at
+            FROM question_flags
+            WHERE bank_id = ?1
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .map_err(|err| err.to_string())?;
+
+    let flags = stmt.query_map(params![bank_id], |row| {
+        Ok(QuestionFlagRow {
+            bank_id: row.get(0)?,
+            question_id: row.get(1)?,
+            flag_type: row.get(2)?,
+            note: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })
+    .map_err(|err| err.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| err.to_string())?;
+    Ok(flags)
+}
+
+#[tauri::command]
+fn set_question_flag(input: SetQuestionFlagInput) -> Result<Vec<QuestionFlagRow>, String> {
+    let conn = open_app_db()?;
+    let now = Utc::now().to_rfc3339();
+    if input.enabled {
+        conn.execute(
+            r#"
+            INSERT INTO question_flags (id, bank_id, question_id, flag_type, note, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(bank_id, question_id, flag_type)
+            DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at
+            "#,
+            params![Uuid::new_v4().to_string(), input.bank_id, input.question_id, input.flag_type, input.note, now],
+        )
+        .map_err(|err| err.to_string())?;
+    } else {
+        conn.execute(
+            "DELETE FROM question_flags WHERE bank_id = ?1 AND question_id = ?2 AND flag_type = ?3",
+            params![input.bank_id, input.question_id, input.flag_type],
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    list_question_flags(input.bank_id)
+}
+
+#[tauri::command]
+fn list_review_questions(bank_id: String, review_mode: String) -> Result<Vec<QuestionSummary>, String> {
+    let ids = review_question_ids(&bank_id, &review_mode)?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = open_bank(&bank_id)?;
+    let mut questions = Vec::new();
+    for id in ids {
+        let question = conn
+            .query_row(
+                r#"
+                SELECT id, sequence_number, question_type, status, page_from, page_to,
+                       substr(replace(question_text, char(10), ' '), 1, 180) AS preview,
+                       coalesce(recommended_answer, '')
+                FROM questions
+                WHERE id = ?1
+                "#,
+                params![id],
+                |row| {
+                    Ok(QuestionSummary {
+                        id: row.get(0)?,
+                        sequence_number: row.get(1)?,
+                        question_type: row.get(2)?,
+                        status: row.get(3)?,
+                        page_from: row.get(4)?,
+                        page_to: row.get(5)?,
+                        preview: row.get(6)?,
+                        recommended_answer: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(|err| err.to_string())?;
+        questions.push(question);
+    }
+    questions.sort_by_key(|question| question.sequence_number);
+    Ok(questions)
+}
+
+fn review_question_ids(bank_id: &str, review_mode: &str) -> Result<Vec<String>, String> {
+    let conn = open_app_db()?;
+    if review_mode == "wrong" {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT DISTINCT question_id
+                FROM exam_answers
+                WHERE bank_id = ?1 AND is_correct = 0
+                UNION
+                SELECT question_id
+                FROM question_flags
+                WHERE bank_id = ?1 AND flag_type = 'wrong'
+                "#,
+            )
+            .map_err(|err| err.to_string())?;
+        return stmt
+            .query_map(params![bank_id], |row| row.get(0))
+            .map_err(|err| err.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string());
+    }
+
+    let flag_type = match review_mode {
+        "favorite" => "favorite",
+        "needs_review" => "needs_review",
+        "mastered" => "mastered",
+        _ => "needs_review",
+    };
+    let mut stmt = conn
+        .prepare("SELECT question_id FROM question_flags WHERE bank_id = ?1 AND flag_type = ?2 ORDER BY updated_at DESC")
+        .map_err(|err| err.to_string())?;
+    let ids = stmt.query_map(params![bank_id, flag_type], |row| row.get(0))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    Ok(ids)
+}
+
+#[tauri::command]
+fn get_interaction_model(bank_id: String, question_id: String) -> Result<InteractionModel, String> {
+    let conn = open_bank(&bank_id)?;
+    let question = get_question(bank_id, question_id)?;
+    let normalized = question.question_type.to_lowercase();
+
+    if !question.options.is_empty() {
+        return Ok(InteractionModel {
+            kind: if normalized.contains("multiple") { "multiple_choice" } else { "single_choice" }.to_string(),
+            can_auto_grade: true,
+            message: "标准选择题，使用 options 表自动判分。".to_string(),
+            options: question
+                .options
+                .into_iter()
+                .map(|option| InteractionOption {
+                    key: option.option_key,
+                    text: option.option_text,
+                    group: None,
+                    is_distractor: false,
+                    sort_order: option.sort_order,
+                })
+                .collect(),
+            rows: Vec::new(),
+            slots: Vec::new(),
+            answer_key: Vec::new(),
+        });
+    }
+
+    if normalized.contains("hotspot") && table_exists(&conn, "hotspot_rows") {
+        return Ok(InteractionModel {
+            kind: "hotspot".to_string(),
+            can_auto_grade: true,
+            message: "检测到 hotspot_rows，已启用结构化 Hotspot 框架。".to_string(),
+            options: query_interaction_options(&conn, "hotspot_options", &question.id)?,
+            rows: query_hotspot_rows(&conn, &question.id)?,
+            slots: Vec::new(),
+            answer_key: Vec::new(),
+        });
+    }
+
+    if normalized.contains("drag") && table_exists(&conn, "drag_slots") {
+        let slots = query_drag_slots(&conn, &question.id)?;
+        return Ok(InteractionModel {
+            kind: "drag_drop".to_string(),
+            can_auto_grade: true,
+            message: "检测到 drag_slots，已启用结构化 Drag Drop 框架。".to_string(),
+            options: query_interaction_options(&conn, "drag_options", &question.id)?,
+            answer_key: slots.iter().filter_map(|slot| slot.correct_option.clone()).collect(),
+            rows: Vec::new(),
+            slots,
+        });
+    }
+
+    Ok(InteractionModel {
+        kind: "manual".to_string(),
+        can_auto_grade: false,
+        message: "当前题库缺少结构化 Hotspot/Drag Drop 原始数据，已降级为人工自评；未来 SQL 补齐表后可自动上线。".to_string(),
+        options: Vec::new(),
+        rows: question
+            .answer_areas
+            .into_iter()
+            .map(|row| InteractionRow {
+                id: format!("manual-{}", row.sort_order),
+                prompt: row.prompt,
+                option_group: None,
+                correct_selection: Some(row.recommended_selection),
+                sort_order: row.sort_order,
+            })
+            .collect(),
+        slots: Vec::new(),
+        answer_key: Vec::new(),
+    })
+}
+
+fn query_interaction_options(conn: &Connection, table: &str, question_id: &str) -> Result<Vec<InteractionOption>, String> {
+    if !table_exists(conn, table) {
+        return Ok(Vec::new());
+    }
+    let sql = if table == "drag_options" {
+        format!("SELECT id, option_text, NULL, coalesce(is_distractor, 0), sort_order FROM {table} WHERE question_id = ?1 ORDER BY sort_order")
+    } else {
+        format!("SELECT id, option_text, option_group, 0, sort_order FROM {table} WHERE question_id = ?1 ORDER BY sort_order")
+    };
+    let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
+    let options = stmt.query_map(params![question_id], |row| {
+        let is_distractor: i64 = row.get(3)?;
+        Ok(InteractionOption {
+            key: row.get::<_, String>(0)?,
+            text: row.get(1)?,
+            group: row.get(2)?,
+            is_distractor: is_distractor != 0,
+            sort_order: row.get(4)?,
+        })
+    })
+    .map_err(|err| err.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| err.to_string())?;
+    Ok(options)
+}
+
+fn query_hotspot_rows(conn: &Connection, question_id: &str) -> Result<Vec<InteractionRow>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, prompt, option_group, correct_selection, sort_order FROM hotspot_rows WHERE question_id = ?1 ORDER BY sort_order")
+        .map_err(|err| err.to_string())?;
+    let rows = stmt.query_map(params![question_id], |row| {
+        Ok(InteractionRow {
+            id: row.get(0)?,
+            prompt: row.get(1)?,
+            option_group: row.get(2)?,
+            correct_selection: row.get(3)?,
+            sort_order: row.get(4)?,
+        })
+    })
+    .map_err(|err| err.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| err.to_string())?;
+    Ok(rows)
+}
+
+fn query_drag_slots(conn: &Connection, question_id: &str) -> Result<Vec<InteractionSlot>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, slot_label, correct_option, sort_order FROM drag_slots WHERE question_id = ?1 ORDER BY sort_order")
+        .map_err(|err| err.to_string())?;
+    let slots = stmt.query_map(params![question_id], |row| {
+        Ok(InteractionSlot {
+            id: row.get(0)?,
+            label: row.get(1)?,
+            correct_option: row.get(2)?,
+            sort_order: row.get(3)?,
+        })
+    })
+    .map_err(|err| err.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| err.to_string())?;
+    Ok(slots)
+}
+
+#[tauri::command]
+fn get_ai_settings() -> Result<AiSettings, String> {
+    load_ai_settings()
+}
+
+#[tauri::command]
+fn save_ai_settings(settings: AiSettings) -> Result<AiSettings, String> {
+    let conn = open_app_db()?;
+    set_setting(&conn, "ai.enabled", if settings.enabled { "true" } else { "false" })?;
+    set_setting(&conn, "ai.base_url", &settings.base_url)?;
+    set_setting(&conn, "ai.api_version", &settings.api_version)?;
+    set_setting(&conn, "ai.api_key", &settings.api_key)?;
+    set_setting(&conn, "ai.model", &settings.model)?;
+    set_setting(&conn, "ai.temperature", &settings.temperature.to_string())?;
+    set_setting(&conn, "translation.provider", &settings.translation_provider)?;
+    set_setting(&conn, "translator.endpoint", &settings.translator_endpoint)?;
+    set_setting(&conn, "translator.key", &settings.translator_key)?;
+    set_setting(&conn, "translator.region", &settings.translator_region)?;
+    load_ai_settings()
+}
+
+#[tauri::command]
+fn test_translator_settings(settings: AiSettings) -> Result<TranslatorTestResult, String> {
+    let source_text = "Hello".to_string();
+    let translated = call_translator_batch_api(
+        &settings,
+        &[TranslationSegment {
+            field_name: "probe".to_string(),
+            segment_index: 0,
+            source_text: source_text.clone(),
+        }],
+        "zh-CN",
+    )?;
+    let translated_text = translated.into_iter().next().ok_or_else(|| "Microsoft Translator 测试没有返回译文。".to_string())?;
+    Ok(TranslatorTestResult { source_text, translated_text })
+}
+
+#[tauri::command]
+async fn ask_ai_about_question(input: AiQuestionRequest) -> Result<AiResponseResult, String> {
+    tauri::async_runtime::spawn_blocking(move || ask_ai_about_question_blocking(input))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn ask_ai_about_question_blocking(input: AiQuestionRequest) -> Result<AiResponseResult, String> {
+    let settings = load_ai_settings()?;
+    let question = get_question(input.bank_id.clone(), input.question_id.clone())?;
+    let prompt = ai_question_prompt(&input, &question);
+    let content = call_responses_api(&settings, &prompt)?;
+    save_ai_exchange(&input.bank_id, &input.question_id, &settings, &prompt, &content)?;
+    Ok(AiResponseResult { content })
+}
+
+#[tauri::command]
+async fn ask_ai_about_question_stream(input: AiQuestionRequest, on_event: Channel<AiStreamEvent>) -> Result<AiResponseResult, String> {
+    tauri::async_runtime::spawn_blocking(move || ask_ai_about_question_stream_blocking(input, on_event))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn ask_ai_about_question_stream_blocking(input: AiQuestionRequest, on_event: Channel<AiStreamEvent>) -> Result<AiResponseResult, String> {
+    let question_id = input.question_id.clone();
+    let settings = load_ai_settings()?;
+    let question = get_question(input.bank_id.clone(), input.question_id.clone())?;
+    let prompt = ai_question_prompt(&input, &question);
+    let result = call_responses_api_stream(&settings, &prompt, |delta| {
+        on_event
+            .send(AiStreamEvent {
+                question_id: question_id.clone(),
+                delta: delta.to_string(),
+                done: false,
+                error: None,
+            })
+            .map_err(|err| err.to_string())
+    });
+    match result {
+        Ok(mut content) => {
+            if content.trim().is_empty() {
+                content = call_responses_api(&settings, &prompt)?;
+                on_event
+                    .send(AiStreamEvent {
+                        question_id: question_id.clone(),
+                        delta: content.clone(),
+                        done: false,
+                        error: None,
+                    })
+                    .map_err(|err| err.to_string())?;
+            }
+            save_ai_exchange(&input.bank_id, &input.question_id, &settings, &prompt, &content)?;
+            on_event
+                .send(AiStreamEvent {
+                    question_id,
+                    delta: String::new(),
+                    done: true,
+                    error: None,
+                })
+                .map_err(|err| err.to_string())?;
+            Ok(AiResponseResult { content })
+        }
+        Err(err) => {
+            let _ = on_event.send(AiStreamEvent {
+                question_id,
+                delta: String::new(),
+                done: true,
+                error: Some(err.clone()),
+            });
+            Err(err)
+        }
+    }
+}
+
+fn ai_question_prompt(input: &AiQuestionRequest, question: &QuestionDetail) -> String {
+    format!(
+        "请用中文详细分析这道考试题。要求：1) 解释题干问什么；2) 解释正确答案为什么正确；3) 分析每个错误选项为什么错；4) 提炼知识点；5) 给出记忆方法。\n\n用户追问或补充：{}\n\n题目上下文：\n{}",
+        input.user_prompt.clone().unwrap_or_else(|| "请进行完整分析。".to_string()),
+        question_context(question)
+    )
+}
+
+fn save_ai_exchange(bank_id: &str, question_id: &str, settings: &AiSettings, prompt: &str, content: &str) -> Result<(), String> {
+    let conn = open_app_db()?;
+    let now = Utc::now().to_rfc3339();
+    let conversation_id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO ai_conversations (id, bank_id, question_id, title, provider, model, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'openai-compatible', ?5, ?6, ?6)",
+        params![conversation_id, bank_id, question_id, "题目分析", settings.model, now],
+    )
+    .map_err(|err| err.to_string())?;
+    for (role, text) in [("user", prompt), ("assistant", content)] {
+        conn.execute(
+            "INSERT INTO ai_messages (id, conversation_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![Uuid::new_v4().to_string(), conversation_id, role, text, now],
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_cached_translations(bank_id: String, question_id: String, language: String) -> Result<Vec<TranslationRow>, String> {
+    load_translation_rows(&bank_id, &question_id, &language)
+}
+
+#[tauri::command]
+async fn translate_question(input: TranslateQuestionInput) -> Result<Vec<TranslationRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || translate_question_blocking(input))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn translate_question_blocking(input: TranslateQuestionInput) -> Result<Vec<TranslationRow>, String> {
+    if !input.force {
+        let cached = load_translation_rows(&input.bank_id, &input.question_id, &input.language)?;
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+    }
+    let settings = load_ai_settings()?;
+    let question = get_question(input.bank_id.clone(), input.question_id.clone())?;
+    let segments = translation_segments_from_question(&question);
+    let (translated_segments, provider, model) = if settings.translation_provider == "microsoft_translator" {
+        (
+            call_translator_batch_api(&settings, &segments, &input.language)?,
+            "microsoft-translator".to_string(),
+            "text-translation-v3".to_string(),
+        )
+    } else {
+        (call_ai_translation_api(&settings, &segments, &input.language)?, "ai".to_string(), settings.model.clone())
+    };
+    if translated_segments.len() != segments.len() {
+        return Err(format!("翻译结果数量不匹配：期望 {}，实际 {}。", segments.len(), translated_segments.len()));
+    }
+    if input.force {
+        clear_translation_rows(&input.bank_id, &input.question_id, &input.language)?;
+    }
+    let mut rows = Vec::new();
+    for (segment, translated) in segments.iter().zip(translated_segments.iter()) {
+        rows.push(save_translation_segment(
+            &input.bank_id,
+            &input.question_id,
+            &segment.field_name,
+            segment.segment_index,
+            &segment.source_text,
+            &input.language,
+            translated,
+            &provider,
+            &model,
+        )?);
+    }
+    Ok(rows)
+}
+
+fn clear_translation_rows(bank_id: &str, question_id: &str, language: &str) -> Result<(), String> {
+    let conn = open_app_db()?;
+    conn.execute(
+        "DELETE FROM translation_segments WHERE bank_id = ?1 AND question_id = ?2 AND language = ?3",
+        params![bank_id, question_id, language],
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+fn translation_segments_from_question(question: &QuestionDetail) -> Vec<TranslationSegment> {
+    let mut segments = Vec::new();
+    push_translation_segment(&mut segments, "question_text", 0, &question.question_text);
+    for option in &question.options {
+        push_translation_segment(&mut segments, &format!("option:{}", option.option_key), 0, &option.option_text);
+    }
+    for answer_area in &question.answer_areas {
+        push_translation_segment(&mut segments, &format!("answer_area_prompt:{}", answer_area.sort_order), 0, &answer_area.prompt);
+        if let Some(source_selection) = &answer_area.source_selection {
+            push_translation_segment(&mut segments, &format!("answer_area_source:{}", answer_area.sort_order), 0, source_selection);
+        }
+        push_translation_segment(
+            &mut segments,
+            &format!("answer_area_recommended:{}", answer_area.sort_order),
+            0,
+            &answer_area.recommended_selection,
+        );
+    }
+    if let Some(source_answer) = &question.source_answer {
+        push_translation_segment(&mut segments, "source_answer", 0, source_answer);
+    }
+    if let Some(recommended_answer) = &question.recommended_answer {
+        push_translation_segment(&mut segments, "recommended_answer", 0, recommended_answer);
+    }
+    if let Some(chinese_judgement) = &question.chinese_judgement {
+        push_translation_segment(&mut segments, "chinese_judgement", 0, chinese_judgement);
+    }
+    if let Some(reasoning) = &question.reasoning {
+        push_translation_segment(&mut segments, "reasoning", 0, reasoning);
+    }
+    if let Some(notes) = &question.notes {
+        push_translation_segment(&mut segments, "notes", 0, notes);
+    }
+    segments
+}
+
+fn push_translation_segment(segments: &mut Vec<TranslationSegment>, field_name: &str, segment_index: i64, source_text: &str) {
+    if source_text.trim().is_empty() {
+        return;
+    }
+    segments.push(TranslationSegment {
+        field_name: field_name.to_string(),
+        segment_index,
+        source_text: source_text.trim().to_string(),
+    });
+}
+
+fn save_translation_segment(
+    bank_id: &str,
+    question_id: &str,
+    field_name: &str,
+    segment_index: i64,
+    source_text: &str,
+    language: &str,
+    translated_text: &str,
+    provider: &str,
+    model: &str,
+) -> Result<TranslationRow, String> {
+    let conn = open_app_db()?;
+    let now = Utc::now().to_rfc3339();
+    let source_hash = hash_text(source_text);
+    let version = conn
+        .query_row(
+            "SELECT coalesce(max(version), 0) + 1 FROM translation_segments WHERE bank_id = ?1 AND question_id = ?2 AND field_name = ?3 AND segment_index = ?4 AND language = ?5",
+            params![bank_id, question_id, field_name, segment_index, language],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(1);
+    conn.execute(
+        r#"
+        INSERT INTO translation_segments
+        (id, bank_id, question_id, field_name, segment_index, source_hash, language, translated_text, provider, model, version, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+        "#,
+        params![Uuid::new_v4().to_string(), bank_id, question_id, field_name, segment_index, source_hash, language, translated_text, provider, model, version, now],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(TranslationRow {
+        field_name: field_name.to_string(),
+        segment_index,
+        source_hash,
+        language: language.to_string(),
+        translated_text: translated_text.to_string(),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        version,
+    })
+}
+
+fn load_translation_rows(bank_id: &str, question_id: &str, language: &str) -> Result<Vec<TranslationRow>, String> {
+    let conn = open_app_db()?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT field_name, segment_index, source_hash, language, translated_text, provider, model, version
+            FROM translation_segments t
+            WHERE bank_id = ?1 AND question_id = ?2 AND language = ?3
+              AND version = (
+                SELECT max(version) FROM translation_segments
+                WHERE bank_id = t.bank_id AND question_id = t.question_id AND field_name = t.field_name
+                  AND segment_index = t.segment_index AND language = t.language
+              )
+            ORDER BY field_name, segment_index
+            "#,
+        )
+        .map_err(|err| err.to_string())?;
+    let rows = stmt.query_map(params![bank_id, question_id, language], |row| {
+        Ok(TranslationRow {
+            field_name: row.get(0)?,
+            segment_index: row.get(1)?,
+            source_hash: row.get(2)?,
+            language: row.get(3)?,
+            translated_text: row.get(4)?,
+            provider: row.get(5)?,
+            model: row.get(6)?,
+            version: row.get(7)?,
+        })
+    })
+    .map_err(|err| err.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| err.to_string())?;
+    Ok(rows)
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             list_banks,
+            refresh_banks,
+            get_app_paths,
+            open_data_dir,
+            open_question_banks_dir,
+            check_bank_health,
             list_questions,
             get_question,
             get_source_pages,
             save_exam_result,
             list_exam_sessions,
-            list_exam_answers
+            list_exam_answers,
+            list_question_flags,
+            set_question_flag,
+            list_review_questions,
+            get_interaction_model,
+            get_ai_settings,
+            save_ai_settings,
+            test_translator_settings,
+            ask_ai_about_question,
+            ask_ai_about_question_stream,
+            get_cached_translations,
+            translate_question
         ])
         .run(tauri::generate_context!())
         .expect("error while running TauriExam");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "uses saved live Microsoft Translator credentials"]
+    fn translator_live_hello_with_saved_settings() {
+        let settings = load_ai_settings().expect("load saved app settings");
+        assert!(
+            !settings.translator_key.trim().is_empty(),
+            "translator key is empty in saved settings"
+        );
+        assert!(
+            !settings.translator_endpoint.trim().is_empty(),
+            "translator endpoint is empty in saved settings"
+        );
+        let region = translator_region_for_config(&settings).expect("resolve translator region");
+        let url = translator_url_with_target("https://api.cognitive.microsofttranslator.com/translate", "zh-Hans");
+        println!("translator endpoint shape: {}", sanitized_translator_endpoint_shape(&settings.translator_endpoint));
+        println!("translator region: {region}");
+        println!("translator request path: {}", super::sanitized_translator_url_path(&url));
+        let result = call_translator_batch_api(
+            &settings,
+            &[TranslationSegment {
+                field_name: "probe".to_string(),
+                segment_index: 0,
+                source_text: "Hello".to_string(),
+            }],
+            "zh-CN",
+        )
+        .expect("translate Hello with saved Microsoft Translator settings");
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].contains('你') || result[0].contains('好') || result[0].to_lowercase() != "hello",
+            "unexpected translation result: {}",
+            result[0]
+        );
+        println!("translator live result: {}", result[0]);
+    }
+
+    fn sanitized_translator_endpoint_shape(endpoint: &str) -> &'static str {
+        let lower = endpoint.to_lowercase();
+        if lower.contains(".cognitiveservices.azure.com") {
+            "custom-cognitiveservices"
+        } else if lower.contains(".cognitive.microsofttranslator.com") {
+            "translator-global-or-regional"
+        } else {
+            "other"
+        }
+    }
+
 }
