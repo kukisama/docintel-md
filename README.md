@@ -33,6 +33,39 @@ DOCINTEL_CLOUD=21v
 .\target\release\docintel-md.exe analyze --input ..\GAL4_User_Manual_ADLDS.pdf
 ```
 
+大 PDF 建议先本地拆分测试，再分块提交：
+
+```powershell
+.\target\release\docintel-md.exe split --input ".\SC-100 题目+答案+讨论.pdf" --pages-per-chunk 200
+.\target\release\docintel-md.exe analyze --input ".\SC-100 题目+答案+讨论.pdf" --split-pages 200
+```
+
+`split` 只会在本地生成 PDF chunk，不调用 Azure；`analyze --split-pages <n>` 会把 PDF 按每 `n` 页拆分，逐个 chunk 提交给 Document Intelligence，并在输出目录生成合并后的 `*.document-intelligence.combined.md`。
+
+把大型 Markdown 机械切分成单题片段，方便后续逐题交给 AI 抽取 JSON：
+
+```powershell
+.\target\release\docintel-md.exe segment --input ".\output\document-intelligence\SC-100 题目+答案+讨论\SC-100 题目+答案+讨论.document-intelligence.combined.md" --exam SC-100
+```
+
+`segment` 会识别 `# Question #1` 这类题号标题，输出 `segments\sc-100-0001-q0001.md` 等单题片段，并生成 `manifest.json` 记录处理序号、原题号、题号重复次数、行号、内容 hash 和处理状态。这个阶段不调用 AI，适合先检查切题边界是否可靠。
+
+从切分结果机械抽取前 40 题为一题一个 JSON：
+
+```powershell
+.\target\release\docintel-md.exe extract-json --manifest ".\output\question-pipeline\SC-100 题目+答案+讨论.document-intelligence.combined\manifest.json" --from 1 --limit 40
+```
+
+`extract-json` 会使用全局处理序号作为稳定主键，同时保留 OCR 中的原题号和重复次数。对于截图题、HOTSPOT、选项/答案无法可靠识别的题目，会把 `status` 标记为 `needs_review` 并写入 `warnings`，方便后续逐题交给 AI 或人工复核。
+
+把视觉整理后的标准 Markdown 导入 SQLite：
+
+```powershell
+C:/Users/kukisama/AppData/Local/Programs/Python/Python312/python.exe scripts/import_vision_md_to_sqlite.py --reset
+```
+
+默认读取 `output\vision-md\**\sc-100-questions-*.md`，生成 `output\vision-db\sc-100.sqlite`。数据库会保留批次目录信息、原题号、页码范围、题型、状态、完整题目 Markdown、题干、选项、HOTSPOT/DRAG DROP 答案区、源答案、我的推荐答案、中文判断、推理和备注。`page_from` / `page_to` 可用于在应用中展开 PDF 对应页或预渲染页面图片。
+
 指定输出目录：
 
 ```powershell

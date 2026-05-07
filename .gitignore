@@ -1,2 +1,7 @@
 target/
 .env
+output/
+*.pdf
+*.md
+.md
+.pdf

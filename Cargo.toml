@@ -5,6 +5,7 @@ edition = "2021"
 description = "Tiny Azure Document Intelligence REST CLI that converts PDF/images to Markdown and JSON deliverables."
 
 [dependencies]
+lopdf = "0.34"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 serde_json = "1"
 

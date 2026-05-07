@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Config {
     input: PathBuf,
     output: Option<PathBuf>,
@@ -18,6 +18,15 @@ struct Config {
     figure_mode: FigureMode,
     poll_seconds: u64,
     timeout_seconds: u64,
+    split_pages: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct PdfChunk {
+    path: PathBuf,
+    first_page: u32,
+    last_page: u32,
+    total_pages: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -63,6 +72,18 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    if args.first().map(String::as_str) == Some("split") {
+        return split_command(&args[1..]);
+    }
+
+    if args.first().map(String::as_str) == Some("segment") {
+        return segment_command(&args[1..]);
+    }
+
+    if args.first().map(String::as_str) == Some("extract-json") {
+        return extract_json_command(&args[1..]);
+    }
+
     let args = if args.first().map(String::as_str) == Some("analyze") {
         &args[1..]
     } else {
@@ -77,8 +98,92 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "docintel-md\n\nUsage:\n  docintel-md analyze --input <file> [--output <dir>] [--endpoint <url>] [--key <key>] [--cloud global|21v] [--figure-mode inline|ignore|separate]\n\nConfig can come from .env in the current directory, .env next to the exe, or environment variables:\n  DOCINTEL_ENDPOINT\n  DOCINTEL_KEY\n  DOCINTEL_CLOUD\n  DOCINTEL_API_VERSION\n  DOCINTEL_MODEL\n  DOCINTEL_FIGURE_MODE\n\nFigure modes:\n  inline    Keep figure OCR blocks in the main Markdown\n  ignore    Remove figure OCR blocks from the main Markdown\n  separate  Remove figure OCR blocks from the main Markdown and write them to *.figures.md\n\nDefaults:\n  --cloud global\n  --api-version 2024-11-30\n  --model prebuilt-layout\n  --figure-mode separate\n  --poll-seconds 1\n  --timeout-seconds 300"
+        "docintel-md\n\nUsage:\n  docintel-md analyze --input <file> [--output <dir>] [--endpoint <url>] [--key <key>] [--cloud global|21v] [--figure-mode inline|ignore|separate] [--split-pages <n>]\n  docintel-md split --input <file.pdf> [--output <dir>] [--pages-per-chunk <n>]\n  docintel-md segment --input <file.md> [--output <dir>] [--exam <code>]\n  docintel-md extract-json --manifest <manifest.json> [--output <dir>] [--from <n>] [--limit <n>]\n\nConfig can come from .env in the current directory, .env next to the exe, or environment variables:\n  DOCINTEL_ENDPOINT\n  DOCINTEL_KEY\n  DOCINTEL_CLOUD\n  DOCINTEL_API_VERSION\n  DOCINTEL_MODEL\n  DOCINTEL_FIGURE_MODE\n\nFigure modes:\n  inline    Keep figure OCR blocks in the main Markdown\n  ignore    Remove figure OCR blocks from the main Markdown\n  separate  Remove figure OCR blocks from the main Markdown and write them to *.figures.md\n\nLarge PDFs:\n  --split-pages <n> submits PDF chunks of n pages each, then writes a combined Markdown file\n  split only creates local PDF chunks, useful for testing before submitting\n\nQuestion pipeline:\n  segment splits a large Markdown export into one Markdown file per detected question and writes manifest.json\n  extract-json reads manifest.json and segments, then writes one structured JSON file per question\n\nDefaults:\n  --cloud global\n  --api-version 2024-11-30\n  --model prebuilt-layout\n  --figure-mode separate\n  --poll-seconds 1\n  --timeout-seconds 300\n  --pages-per-chunk 200\n  --exam SC-100\n  --from 1"
     );
+}
+
+fn split_command(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args)?;
+    let input = flags
+        .get("input")
+        .map(PathBuf::from)
+        .ok_or("missing --input <file.pdf>")?;
+    if !input.exists() {
+        return Err(format!("input not found: {}", input.display()));
+    }
+    if content_type_for(&input)? != "application/pdf" {
+        return Err("split only supports PDF input".to_string());
+    }
+
+    let pages_per_chunk =
+        parse_positive_u32(flags.get("pages-per-chunk"), "pages-per-chunk")?.unwrap_or(200);
+    let output_dir = flags
+        .get("output")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_split_dir(&input));
+    let chunks = split_pdf(&input, &output_dir, pages_per_chunk)?;
+
+    println!(
+        "Split {} into {} chunk(s) under {}",
+        input.display(),
+        chunks.len(),
+        output_dir.display()
+    );
+    for (index, chunk) in chunks.iter().enumerate() {
+        println!(
+            "  {:>3}. pages {}-{} of {} -> {}",
+            index + 1,
+            chunk.first_page,
+            chunk.last_page,
+            chunk.total_pages,
+            chunk.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn segment_command(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args)?;
+    let input = flags
+        .get("input")
+        .map(PathBuf::from)
+        .ok_or("missing --input <file.md>")?;
+    if !input.exists() {
+        return Err(format!("input not found: {}", input.display()));
+    }
+
+    let exam = flags
+        .get("exam")
+        .cloned()
+        .unwrap_or_else(|| "SC-100".to_string());
+    let output_dir = flags
+        .get("output")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_segment_dir(&input));
+    segment_markdown(&input, &output_dir, &exam)
+}
+
+fn extract_json_command(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args)?;
+    let manifest = flags
+        .get("manifest")
+        .or_else(|| flags.get("input"))
+        .map(PathBuf::from)
+        .ok_or("missing --manifest <manifest.json>")?;
+    if !manifest.exists() {
+        return Err(format!("manifest not found: {}", manifest.display()));
+    }
+
+    let from = parse_positive_u32(flags.get("from"), "from")?.unwrap_or(1) as usize;
+    let limit = parse_positive_u32(flags.get("limit"), "limit")?.map(|value| value as usize);
+    let output_dir = flags.get("output").map(PathBuf::from).unwrap_or_else(|| {
+        manifest
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("questions")
+    });
+
+    extract_json_from_manifest(&manifest, &output_dir, from, limit)
 }
 
 fn parse_flags(args: &[String]) -> Result<HashMap<String, String>, String> {
@@ -197,7 +302,21 @@ fn build_config(
             .get("timeout-seconds")
             .and_then(|v| v.parse().ok())
             .unwrap_or(300),
+        split_pages: parse_positive_u32(flags.get("split-pages"), "split-pages")?,
     })
+}
+
+fn parse_positive_u32(value: Option<&String>, name: &str) -> Result<Option<u32>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("--{name} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("--{name} must be greater than 0"));
+    }
+    Ok(Some(parsed))
 }
 
 fn get_value(
@@ -240,6 +359,72 @@ fn validate_cloud_endpoint(cloud: &str, endpoint: &str) -> Result<(), String> {
 }
 
 fn analyze(config: Config) -> Result<(), String> {
+    if let Some(split_pages) = config.split_pages {
+        return analyze_split_pdf(config, split_pages);
+    }
+
+    analyze_single(config)
+}
+
+fn analyze_split_pdf(config: Config, split_pages: u32) -> Result<(), String> {
+    if content_type_for(&config.input)? != "application/pdf" {
+        return Err("--split-pages only supports PDF input".to_string());
+    }
+
+    let output_dir = config
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output_dir(&config.input));
+    fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("failed to create output dir {}: {e}", output_dir.display()))?;
+
+    let chunks_dir = output_dir.join("_chunks");
+    let chunks = split_pdf(&config.input, &chunks_dir, split_pages)?;
+    println!(
+        "Submitting {} PDF chunk(s) to Document Intelligence...",
+        chunks.len()
+    );
+
+    let mut markdown_parts = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let chunk_output_dir = output_dir.join(format!(
+            "part-{index:03}-pages-{first:04}-{last:04}",
+            index = index + 1,
+            first = chunk.first_page,
+            last = chunk.last_page
+        ));
+        let mut chunk_config = config.clone();
+        chunk_config.input = chunk.path.clone();
+        chunk_config.output = Some(chunk_output_dir.clone());
+        chunk_config.split_pages = None;
+
+        println!(
+            "Chunk {}/{}: pages {}-{} of {}",
+            index + 1,
+            chunks.len(),
+            chunk.first_page,
+            chunk.last_page,
+            chunk.total_pages
+        );
+        analyze_single(chunk_config)?;
+
+        let chunk_stem = chunk
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("document");
+        markdown_parts.push((
+            chunk.first_page,
+            chunk.last_page,
+            chunk_output_dir.join(format!("{chunk_stem}.document-intelligence.md")),
+        ));
+    }
+
+    write_combined_markdown(&config.input, &output_dir, &markdown_parts)?;
+    Ok(())
+}
+
+fn analyze_single(config: Config) -> Result<(), String> {
     let output_dir = config
         .output
         .clone()
@@ -368,6 +553,676 @@ fn analyze(config: Config) -> Result<(), String> {
     }
     println!("Wrote {}", meta_path.display());
     Ok(())
+}
+
+fn split_pdf(
+    input: &Path,
+    output_dir: &Path,
+    pages_per_chunk: u32,
+) -> Result<Vec<PdfChunk>, String> {
+    if pages_per_chunk == 0 {
+        return Err("pages_per_chunk must be greater than 0".to_string());
+    }
+
+    fs::create_dir_all(output_dir)
+        .map_err(|e| format!("failed to create output dir {}: {e}", output_dir.display()))?;
+
+    let source = lopdf::Document::load(input)
+        .map_err(|e| format!("failed to load PDF {}: {e}", input.display()))?;
+    let page_ids = source.get_pages();
+    let pages: Vec<u32> = page_ids.keys().copied().collect();
+    if pages.is_empty() {
+        return Err(format!("PDF has no pages: {}", input.display()));
+    }
+
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document");
+    let total_pages = pages.len();
+    let mut chunks = Vec::new();
+
+    for (index, chunk_pages) in pages.chunks(pages_per_chunk as usize).enumerate() {
+        let first_page = *chunk_pages.first().unwrap();
+        let last_page = *chunk_pages.last().unwrap();
+        let mut chunk_doc = source.clone();
+        let selected_page_ids = chunk_pages
+            .iter()
+            .map(|page| {
+                page_ids
+                    .get(page)
+                    .copied()
+                    .ok_or_else(|| format!("page {page} not found in PDF page tree"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let catalog_id = chunk_doc
+            .trailer
+            .get(b"Root")
+            .and_then(lopdf::Object::as_reference)
+            .map_err(|e| format!("failed to find PDF catalog: {e}"))?;
+        let pages_root_id = chunk_doc
+            .get_object(catalog_id)
+            .and_then(lopdf::Object::as_dict)
+            .and_then(|dict| dict.get(b"Pages"))
+            .and_then(lopdf::Object::as_reference)
+            .map_err(|e| format!("failed to find PDF Pages root: {e}"))?;
+
+        for page in &pages {
+            if !chunk_pages.contains(page) {
+                if let Some(page_id) = page_ids.get(page) {
+                    chunk_doc.objects.remove(page_id);
+                }
+            }
+        }
+
+        for page_id in &selected_page_ids {
+            let page = chunk_doc
+                .objects
+                .get_mut(page_id)
+                .ok_or_else(|| format!("selected page object {:?} is missing", page_id))?;
+            page.as_dict_mut()
+                .map_err(|e| {
+                    format!(
+                        "selected page object {:?} is not a dictionary: {e}",
+                        page_id
+                    )
+                })?
+                .set("Parent", pages_root_id);
+        }
+
+        chunk_doc
+            .objects
+            .get_mut(&pages_root_id)
+            .ok_or("PDF Pages root object is missing")?
+            .as_dict_mut()
+            .map_err(|e| format!("PDF Pages root is not a dictionary: {e}"))?
+            .set(
+                "Kids",
+                selected_page_ids
+                    .iter()
+                    .copied()
+                    .map(lopdf::Object::Reference)
+                    .collect::<Vec<_>>(),
+            );
+        chunk_doc
+            .objects
+            .get_mut(&pages_root_id)
+            .ok_or("PDF Pages root object is missing")?
+            .as_dict_mut()
+            .map_err(|e| format!("PDF Pages root is not a dictionary: {e}"))?
+            .set("Count", selected_page_ids.len() as u32);
+
+        chunk_doc.prune_objects();
+        chunk_doc.renumber_objects();
+        chunk_doc.compress();
+
+        let chunk_path = output_dir.join(format!(
+            "{stem}.part-{index:03}.pages-{first_page:04}-{last_page:04}.pdf",
+            index = index + 1
+        ));
+        println!(
+            "Writing chunk {}/{}: pages {}-{} of {} -> {}",
+            index + 1,
+            pages.chunks(pages_per_chunk as usize).len(),
+            first_page,
+            last_page,
+            total_pages,
+            chunk_path.display()
+        );
+        chunk_doc
+            .save(&chunk_path)
+            .map_err(|e| format!("failed to write PDF chunk {}: {e}", chunk_path.display()))?;
+
+        chunks.push(PdfChunk {
+            path: chunk_path,
+            first_page,
+            last_page,
+            total_pages,
+        });
+    }
+
+    Ok(chunks)
+}
+
+fn write_combined_markdown(
+    input: &Path,
+    output_dir: &Path,
+    markdown_parts: &[(u32, u32, PathBuf)],
+) -> Result<(), String> {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document");
+    let combined_path = output_dir.join(format!("{stem}.document-intelligence.combined.md"));
+    let mut combined = String::new();
+    combined.push_str(&format!("# {}\n\n", stem));
+    combined.push_str("由多个 PDF chunk 分别提交 Azure Document Intelligence 后合并生成。\n\n");
+
+    for (index, (first_page, last_page, markdown_path)) in markdown_parts.iter().enumerate() {
+        let content = fs::read_to_string(markdown_path)
+            .map_err(|e| format!("failed to read {}: {e}", markdown_path.display()))?;
+        combined.push_str(&format!(
+            "## Part {}：PDF pages {}-{}\n\n",
+            index + 1,
+            first_page,
+            last_page
+        ));
+        combined.push_str(content.trim_end());
+        combined.push_str("\n\n");
+    }
+
+    fs::write(&combined_path, combined)
+        .map_err(|e| format!("failed to write {}: {e}", combined_path.display()))?;
+    println!("Wrote {}", combined_path.display());
+    Ok(())
+}
+
+fn segment_markdown(input: &Path, output_dir: &Path, exam: &str) -> Result<(), String> {
+    let content = fs::read_to_string(input)
+        .map_err(|e| format!("failed to read {}: {e}", input.display()))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let anchors = question_anchors(&lines);
+    if anchors.is_empty() {
+        return Err(format!(
+            "no question headings found in {}; expected headings like '# Question #1'",
+            input.display()
+        ));
+    }
+
+    let segments_dir = output_dir.join("segments");
+    if segments_dir.exists() {
+        fs::remove_dir_all(&segments_dir).map_err(|e| {
+            format!(
+                "failed to remove stale segments dir {}: {e}",
+                segments_dir.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(&segments_dir).map_err(|e| {
+        format!(
+            "failed to create segments dir {}: {e}",
+            segments_dir.display()
+        )
+    })?;
+
+    let exam_slug = slugify(exam);
+    let mut question_number_counts: HashMap<u32, usize> = HashMap::new();
+    let mut items = Vec::new();
+    for (index, (line_index, question_number)) in anchors.iter().enumerate() {
+        let next_line_index = anchors
+            .get(index + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(lines.len());
+        let segment_text = lines[*line_index..next_line_index]
+            .join("\n")
+            .trim()
+            .to_string()
+            + "\n";
+        let occurrence = question_number_counts
+            .entry(*question_number)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        let occurrence_value = *occurrence;
+        let sequence_number = index + 1;
+        let id = format!("{exam_slug}-{sequence_number:04}-q{question_number:04}");
+        let file_name = format!("{id}.md");
+        let segment_path = segments_dir.join(&file_name);
+        fs::write(&segment_path, &segment_text)
+            .map_err(|e| format!("failed to write {}: {e}", segment_path.display()))?;
+
+        items.push(json!({
+            "id": id,
+            "exam": exam,
+            "question_number": question_number,
+            "question_number_occurrence": occurrence_value,
+            "sequence_number": sequence_number,
+            "segment_file": PathBuf::from("segments").join(&file_name).display().to_string(),
+            "line_start": line_index + 1,
+            "line_end": next_line_index,
+            "content_hash": stable_hash_hex(&segment_text),
+            "status": "segmented"
+        }));
+    }
+
+    let manifest = json!({
+        "exam": exam,
+        "source_file": input.display().to_string(),
+        "output_dir": output_dir.display().to_string(),
+        "total_segments": items.len(),
+        "items": items
+    });
+    let manifest_path = output_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap() + "\n",
+    )
+    .map_err(|e| format!("failed to write {}: {e}", manifest_path.display()))?;
+
+    println!(
+        "Segmented {} question(s) from {} into {}",
+        anchors.len(),
+        input.display(),
+        segments_dir.display()
+    );
+    println!("Wrote {}", manifest_path.display());
+    Ok(())
+}
+
+fn extract_json_from_manifest(
+    manifest_path: &Path,
+    output_dir: &Path,
+    from: usize,
+    limit: Option<usize>,
+) -> Result<(), String> {
+    fs::create_dir_all(output_dir)
+        .map_err(|e| format!("failed to create output dir {}: {e}", output_dir.display()))?;
+
+    let manifest_text = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("failed to read {}: {e}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_str(&manifest_text)
+        .map_err(|e| format!("failed to parse manifest JSON: {e}"))?;
+    let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let exam = manifest
+        .get("exam")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let items = manifest
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("manifest missing items array")?;
+
+    let mut written = 0usize;
+    let mut needs_review = 0usize;
+    for item in items {
+        let sequence_number = value_as_usize(item, "sequence_number")?;
+        if sequence_number < from {
+            continue;
+        }
+        if let Some(limit) = limit {
+            if written >= limit {
+                break;
+            }
+        }
+
+        let segment_file = item
+            .get("segment_file")
+            .and_then(Value::as_str)
+            .ok_or("manifest item missing segment_file")?;
+        let segment_path = manifest_dir.join(segment_file);
+        let segment_text = fs::read_to_string(&segment_path)
+            .map_err(|e| format!("failed to read segment {}: {e}", segment_path.display()))?;
+        let parsed = parse_question_segment(&segment_text);
+
+        let mut warnings = parsed.warnings;
+        let question_number_occurrence = value_as_usize(item, "question_number_occurrence")?;
+        if question_number_occurrence > 1 {
+            warnings.push("source_question_number_is_not_unique".to_string());
+        }
+        if segment_text.chars().count() > 12_000 {
+            warnings.push("segment_is_large_for_single_ai_pass".to_string());
+        }
+        warnings.sort();
+        warnings.dedup();
+
+        let status = if warnings.iter().any(|warning| {
+            matches!(
+                warning.as_str(),
+                "no_options_detected"
+                    | "no_correct_answer_detected"
+                    | "correct_answer_not_found_in_options"
+                    | "non_standard_question_type"
+            )
+        }) {
+            needs_review += 1;
+            "needs_review"
+        } else {
+            "parsed"
+        };
+
+        let id = item.get("id").and_then(Value::as_str).unwrap_or("question");
+        let question_json = json!({
+            "schema_version": 1,
+            "id": id,
+            "exam": exam,
+            "sequence_number": sequence_number,
+            "question_number_from_source": value_as_usize(item, "question_number")?,
+            "question_number_occurrence": question_number_occurrence,
+            "answer_type": parsed.answer_type,
+            "topic": parsed.topic,
+            "question": {
+                "original": parsed.question,
+                "zh_cn": null
+            },
+            "options": parsed.options.iter().map(|(key, value)| json!({
+                "key": key,
+                "original": value,
+                "zh_cn": null
+            })).collect::<Vec<_>>(),
+            "correct_answer": parsed.correct_answer,
+            "explanation": {
+                "original": parsed.explanation,
+                "zh_cn": null,
+                "summary": null
+            },
+            "discussion": {
+                "original": parsed.discussion,
+                "zh_cn": null
+            },
+            "source": {
+                "manifest": manifest_path.display().to_string(),
+                "segment_file": segment_file,
+                "line_start": value_as_usize(item, "line_start")?,
+                "line_end": value_as_usize(item, "line_end")?,
+                "content_hash": item.get("content_hash").and_then(Value::as_str).unwrap_or_default()
+            },
+            "confidence": {
+                "mechanical_parse": parsed.confidence
+            },
+            "status": status,
+            "warnings": warnings,
+            "raw_segment": segment_text
+        });
+
+        let output_path = output_dir.join(format!("{id}.json"));
+        fs::write(
+            &output_path,
+            serde_json::to_string_pretty(&question_json).unwrap() + "\n",
+        )
+        .map_err(|e| format!("failed to write {}: {e}", output_path.display()))?;
+        written += 1;
+    }
+
+    println!(
+        "Extracted {} question JSON file(s) into {} ({} need review)",
+        written,
+        output_dir.display(),
+        needs_review
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ParsedQuestion {
+    topic: Option<String>,
+    question: String,
+    options: Vec<(String, String)>,
+    correct_answer: Vec<String>,
+    answer_type: String,
+    explanation: String,
+    discussion: String,
+    confidence: f64,
+    warnings: Vec<String>,
+}
+
+fn parse_question_segment(segment: &str) -> ParsedQuestion {
+    let lines: Vec<&str> = segment.lines().collect();
+    let mut warnings = Vec::new();
+    let comments_index = lines.iter().position(|line| is_comments_heading(line));
+    let main_end = comments_index.unwrap_or(lines.len());
+    let main_lines = &lines[..main_end];
+    let discussion = comments_index
+        .map(|index| lines[index..].join("\n").trim().to_string())
+        .unwrap_or_default();
+    let topic = main_lines
+        .iter()
+        .map(|line| line.trim().trim_start_matches('#').trim())
+        .find(|line| line.starts_with("Topic "))
+        .map(ToString::to_string);
+
+    let answer_index = main_lines
+        .iter()
+        .position(|line| line.trim().starts_with("Correct Answer:"));
+    let correct_answer = answer_index
+        .and_then(|index| main_lines.get(index))
+        .map(|line| parse_correct_answer(line))
+        .unwrap_or_default();
+    if correct_answer.is_empty() {
+        warnings.push("no_correct_answer_detected".to_string());
+    }
+
+    let question_area_end = answer_index.unwrap_or(main_lines.len());
+    let question_area = &main_lines[..question_area_end];
+    let (question, options) = parse_question_and_options(question_area);
+    if options.is_empty() {
+        warnings.push("no_options_detected".to_string());
+    }
+
+    let option_keys: Vec<&str> = options.iter().map(|(key, _)| key.as_str()).collect();
+    if !correct_answer.is_empty()
+        && correct_answer
+            .iter()
+            .any(|answer| !option_keys.contains(&answer.as_str()))
+    {
+        warnings.push("correct_answer_not_found_in_options".to_string());
+    }
+
+    let non_standard = segment.contains("HOTSPOT")
+        || segment.contains("Hot Area")
+        || segment.contains("DRAG DROP")
+        || segment.contains("Case Study")
+        || options.is_empty();
+    let answer_type = if non_standard {
+        warnings.push("non_standard_question_type".to_string());
+        "needs_review".to_string()
+    } else if correct_answer.len() > 1 {
+        "multiple_choice".to_string()
+    } else {
+        "single_choice".to_string()
+    };
+
+    let answer_tail = answer_index
+        .map(|index| main_lines[index + 1..].join("\n").trim().to_string())
+        .unwrap_or_default();
+    let explanation = build_explanation(&answer_tail, &discussion);
+    let confidence = mechanical_confidence(&warnings, options.len(), correct_answer.len());
+
+    ParsedQuestion {
+        topic,
+        question,
+        options,
+        correct_answer,
+        answer_type,
+        explanation,
+        discussion,
+        confidence,
+        warnings,
+    }
+}
+
+fn parse_question_and_options(lines: &[&str]) -> (String, Vec<(String, String)>) {
+    let mut question_lines = Vec::new();
+    let mut options = Vec::new();
+    let mut current_option: Option<(String, Vec<String>)> = None;
+
+    for line in lines {
+        if let Some((key, value)) = parse_option_start(line) {
+            if let Some((previous_key, previous_lines)) = current_option.take() {
+                options.push((previous_key, cleanup_text(&previous_lines.join("\n"))));
+            }
+            current_option = Some((key, vec![value]));
+            continue;
+        }
+
+        if let Some((_, option_lines)) = current_option.as_mut() {
+            option_lines.push((*line).to_string());
+        } else if should_keep_question_line(line) {
+            question_lines.push((*line).to_string());
+        }
+    }
+
+    if let Some((previous_key, previous_lines)) = current_option.take() {
+        options.push((previous_key, cleanup_text(&previous_lines.join("\n"))));
+    }
+
+    (cleanup_text(&question_lines.join("\n")), options)
+}
+
+fn parse_option_start(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let mut chars = trimmed.chars();
+    let key = chars.next()?;
+    let marker = chars.next()?;
+    if !key.is_ascii_uppercase() || !matches!(marker, '.' | ')') {
+        return None;
+    }
+    let rest: String = chars.collect();
+    if rest.trim().is_empty() {
+        return None;
+    }
+    Some((key.to_string(), rest.trim().to_string()))
+}
+
+fn parse_correct_answer(line: &str) -> Vec<String> {
+    let Some((_, answer)) = line.split_once(':') else {
+        return Vec::new();
+    };
+    answer
+        .chars()
+        .filter(|ch| ch.is_ascii_uppercase())
+        .map(|ch| ch.to_string())
+        .collect()
+}
+
+fn build_explanation(answer_tail: &str, discussion: &str) -> String {
+    let answer_tail = cleanup_text(answer_tail);
+    let discussion_explanation = best_discussion_explanation(discussion);
+    if !discussion_explanation.is_empty()
+        && (answer_tail.is_empty()
+            || answer_tail.contains("Community vote distribution")
+            || answer_tail.chars().count() < 120)
+    {
+        return discussion_explanation;
+    }
+    if !discussion_explanation.is_empty() {
+        return format!("{}\n\n---\n\n{}", answer_tail, discussion_explanation);
+    }
+    answer_tail
+}
+
+fn best_discussion_explanation(discussion: &str) -> String {
+    let mut best_score = 0usize;
+    let mut best_block = String::new();
+    for block in discussion.split("upvoted ") {
+        let cleaned = cleanup_text(block);
+        let char_count = cleaned.chars().count();
+        if char_count < 120 {
+            continue;
+        }
+        let lower = cleaned.to_ascii_lowercase();
+        let mut score = 0usize;
+        for marker in [
+            "selected answer",
+            "explanation",
+            " is the answer",
+            " correct",
+            "because",
+            "supports",
+            "requires",
+            "gives you",
+            "capability",
+            "https://",
+        ] {
+            if lower.contains(marker) {
+                score += 1;
+            }
+        }
+        score += (char_count / 400).min(3);
+        if score > best_score {
+            best_score = score;
+            best_block = cleaned;
+        }
+    }
+    best_block
+}
+
+fn is_comments_heading(line: &str) -> bool {
+    line.trim().trim_start_matches('#').trim() == "Comments"
+}
+
+fn should_keep_question_line(line: &str) -> bool {
+    let trimmed = line.trim().trim_start_matches('#').trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with("Question #")
+        && !trimmed.starts_with("Topic ")
+        && trimmed != "EXAMTOPICS"
+        && !trimmed.starts_with("<!--")
+}
+
+fn cleanup_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn mechanical_confidence(warnings: &[String], option_count: usize, answer_count: usize) -> f64 {
+    let mut confidence = 0.95;
+    confidence -= warnings.len() as f64 * 0.12;
+    if option_count < 2 {
+        confidence -= 0.2;
+    }
+    if answer_count == 0 {
+        confidence -= 0.2;
+    }
+    confidence.clamp(0.05, 0.95)
+}
+
+fn value_as_usize(value: &Value, key: &str) -> Result<usize, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .ok_or_else(|| format!("manifest item missing numeric {key}"))
+}
+
+fn question_anchors(lines: &[&str]) -> Vec<(usize, u32)> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| parse_question_heading(line).map(|number| (index, number)))
+        .collect()
+}
+
+fn parse_question_heading(line: &str) -> Option<u32> {
+    let normalized = line.trim().trim_start_matches('#').trim();
+    let rest = normalized.strip_prefix("Question #")?;
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "questions".to_string()
+    } else {
+        slug
+    }
+}
+
+fn stable_hash_hex(text: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 fn figure_count(payload: &Value) -> usize {
@@ -517,9 +1372,7 @@ fn poll_result(
             .set("Ocp-Apim-Subscription-Key", key)
             .call()
             .map_err(format_ureq_error)?;
-        let response_text = response
-            .into_string()
-            .map_err(|e| format!("failed to read service response: {e}"))?;
+        let response_text = read_response_text(response)?;
         let payload: Value = serde_json::from_str(&response_text)
             .map_err(|e| format!("failed to parse service JSON: {e}"))?;
         let status = payload
@@ -542,6 +1395,15 @@ fn poll_result(
     }
 }
 
+fn read_response_text(response: ureq::Response) -> Result<String, String> {
+    let mut response_text = String::new();
+    response
+        .into_reader()
+        .read_to_string(&mut response_text)
+        .map_err(|e| format!("failed to read service response: {e}"))?;
+    Ok(response_text)
+}
+
 fn default_output_dir(input: &Path) -> PathBuf {
     let stem = input
         .file_stem()
@@ -550,6 +1412,22 @@ fn default_output_dir(input: &Path) -> PathBuf {
     PathBuf::from("output")
         .join("document-intelligence")
         .join(stem)
+}
+
+fn default_split_dir(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document");
+    PathBuf::from("output").join("pdf-chunks").join(stem)
+}
+
+fn default_segment_dir(input: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document");
+    PathBuf::from("output").join("question-pipeline").join(stem)
 }
 
 fn content_type_for(path: &Path) -> Result<&'static str, String> {
@@ -624,8 +1502,7 @@ fn write_readme(
 fn format_ureq_error(err: ureq::Error) -> String {
     match err {
         ureq::Error::Status(code, response) => {
-            let text = response
-                .into_string()
+            let text = read_response_text(response)
                 .unwrap_or_else(|_| "<failed to read response body>".to_string());
             format!("service returned HTTP {code}: {text}")
         }
