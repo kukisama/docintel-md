@@ -636,7 +636,47 @@ p {
   gap: 16px;
 }
 
-.settings-grid {
+.settings-sheet {
+  display: grid;
+  gap: 20px;
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0;
+}
+
+.settings-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.settings-tabs button:hover {
+  color: var(--fg);
+}
+
+.settings-tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.settings-tab-body {
+  display: grid;
+  gap: 20px;
+}
+
+.settings-row-pair {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 20px;
@@ -673,6 +713,50 @@ p {
 .health-grid {
   display: grid;
   gap: 10px;
+}
+
+.file-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.file-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.file-table tr:last-child td {
+  border-bottom: none;
+}
+
+.file-table .ft-label {
+  white-space: nowrap;
+  color: var(--muted);
+  width: 80px;
+}
+
+.file-table code {
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.translation-health {
+  display: grid;
+  gap: 6px;
+}
+
+.translation-health-bar {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.translation-health progress {
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
 }
 
 .settings-form-grid {
@@ -726,6 +810,48 @@ p {
 .path-item code {
   overflow-wrap: anywhere;
   color: var(--primary-strong);
+}
+
+.compact-paths .path-item {
+  padding: 10px 12px;
+}
+
+.batch-progress-box {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 14px;
+  background: var(--panel-strong);
+}
+
+.batch-progress-head,
+.batch-progress-stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.batch-progress-head strong {
+  color: var(--primary-strong);
+  font-size: 20px;
+}
+
+.batch-progress-box progress {
+  width: 100%;
+  height: 12px;
+  accent-color: var(--primary);
+}
+
+.batch-progress-box p {
+  margin: 0;
+}
+
+.batch-progress-stats span {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .bank-mini-row {
@@ -1009,7 +1135,7 @@ p {
 
 .ai-input-bar textarea {
   width: 100%;
-  min-height: 72px;
+  min-height: 48px;
 }
 
 .stream-pill {
@@ -1127,7 +1253,7 @@ p {
 
   .content-grid,
   .exam-layout,
-  .settings-grid {
+  .settings-row-pair {
     grid-template-columns: 1fr;
   }
 

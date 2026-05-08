@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -24,6 +24,7 @@ import type {
   AiSettings,
   AiStreamEvent,
   AppPaths,
+  BatchTranslateEvent,
   BankHealth,
   BankInfo,
   ExamAnswerDetail,
@@ -101,6 +102,8 @@ function App() {
   const [translations, setTranslations] = useState<TranslationRow[]>([]);
   const [translationMode, setTranslationMode] = useState<TranslationMode>('original');
   const [translationLanguage, setTranslationLanguage] = useState('zh-CN');
+  const [batchTranslationBusy, setBatchTranslationBusy] = useState(false);
+  const [batchTranslation, setBatchTranslation] = useState<BatchTranslateEvent | null>(null);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -342,7 +345,7 @@ function App() {
     }
   }
 
-  async function askAi() {
+  async function askAi(actionType: 'analyze' | 'summarize' | 'freeform' = 'analyze') {
     if (!detail) return;
     const questionId = detail.id;
     try {
@@ -372,6 +375,7 @@ function App() {
           bank_id: bankId,
           question_id: questionId,
           user_prompt: aiPrompt || null,
+          action_type: actionType,
         },
         streamChannel,
       );
@@ -404,6 +408,36 @@ function App() {
       setError(String(err));
     } finally {
       setTranslationBusy(false);
+    }
+  }
+
+  async function batchTranslateCurrentBank() {
+    if (!bankId || batchTranslationBusy) return;
+    try {
+      setBatchTranslationBusy(true);
+      setError('');
+      setSettingsMessage('正在批量翻译题库，将按题号顺序逐题处理；已存在的翻译会自动跳过。');
+      const channel = api.createBatchTranslateChannel((event: BatchTranslateEvent) => {
+        setBatchTranslation(event);
+        if (event.error) setError(event.error);
+        if (event.done) setBatchTranslationBusy(false);
+      });
+      const result = await api.batchTranslateBank(
+        {
+          bank_id: bankId,
+          language: translationLanguage,
+          force: false,
+        },
+        channel,
+      );
+      setSettingsMessage(`批量翻译完成：新翻译 ${result.translated} 题，跳过 ${result.skipped} 题。翻译库：${result.translation_db_path}`);
+      if (detail) {
+        setTranslations(await api.getCachedTranslations(bankId, detail.id, translationLanguage));
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBatchTranslationBusy(false);
     }
   }
 
@@ -802,18 +836,23 @@ function App() {
             bankHealth={bankHealth}
             aiSettings={aiSettings}
             message={settingsMessage}
+            batchTranslation={batchTranslation}
+            batchTranslationBusy={batchTranslationBusy}
             onOpenDataDir={openDataDir}
             onOpenQuestionBanksDir={openQuestionBanksDir}
             onRefreshBanks={refreshQuestionBanks}
             onCheckHealth={checkCurrentBankHealth}
             onSaveAiSettings={saveAiSettings}
             onTestTranslatorSettings={testTranslatorSettings}
+            onBatchTranslate={batchTranslateCurrentBank}
           />
         )}
       </main>
     </div>
   );
 }
+
+type SettingsTab = 'files' | 'ai' | 'translation';
 
 function SettingsPanel(props: {
   appPaths: AppPaths | null;
@@ -822,14 +861,18 @@ function SettingsPanel(props: {
   bankHealth: BankHealth | null;
   aiSettings: AiSettings | null;
   message: string;
+  batchTranslation: BatchTranslateEvent | null;
+  batchTranslationBusy: boolean;
   onOpenDataDir: () => void;
   onOpenQuestionBanksDir: () => void;
   onRefreshBanks: () => void;
   onCheckHealth: () => void;
   onSaveAiSettings: (settings: AiSettings) => void;
   onTestTranslatorSettings: (settings: AiSettings) => void;
+  onBatchTranslate: () => void;
 }) {
   const currentBank = props.banks.find((bank) => bank.id === props.bankId);
+  const [tab, setTab] = useState<SettingsTab>('files');
   const [draft, setDraft] = useState<AiSettings>(
     props.aiSettings || {
       enabled: false,
@@ -838,6 +881,9 @@ function SettingsPanel(props: {
       api_key: '',
       model: 'gpt-4.1-mini',
       temperature: 0.7,
+      system_prompt: '',
+      prompt_analyze: '',
+      prompt_summarize: '',
       translation_provider: 'ai',
       translator_endpoint: 'https://api.cognitive.microsofttranslator.com',
       translator_key: '',
@@ -849,182 +895,255 @@ function SettingsPanel(props: {
     if (props.aiSettings) setDraft(props.aiSettings);
   }, [props.aiSettings]);
 
+  const batchProgressPercent = props.batchTranslation?.total
+    ? Math.round((props.batchTranslation.current_index / props.batchTranslation.total) * 100)
+    : 0;
+
   return (
-    <section className="settings-grid">
-      <div className="panel settings-card wide">
-        <div className="settings-head">
-          <div>
-            <span className="eyebrow">Local workspace</span>
-            <h3>数据目录与题库目录</h3>
-          </div>
-          <div className="action-row compact-actions">
-            <button onClick={props.onOpenDataDir}>
-              <FolderOpen size={16} /> 打开数据目录
-            </button>
-            <button onClick={props.onOpenQuestionBanksDir}>
-              <FolderOpen size={16} /> 打开题库目录
-            </button>
-          </div>
-        </div>
-        <div className="path-list">
-          <PathItem label="应用数据目录" value={props.appPaths?.data_dir || '加载中...'} />
-          <PathItem label="学习数据库" value={props.appPaths?.app_db_path || '加载中...'} />
-          <PathItem label="题库目录" value={props.appPaths?.question_banks_dir || '加载中...'} />
-          <PathItem label="PDF 缓存目录" value={props.appPaths?.page_cache_dir || '加载中...'} />
-        </div>
-        <p className="muted">把同名文件放入题库目录即可识别：例如 `SC-100.sqlite` + `SC-100.pdf`。</p>
+    <section className="settings-sheet">
+      <div className="settings-tabs">
+        <button className={tab === 'files' ? 'active' : ''} onClick={() => setTab('files')}>
+          <FolderOpen size={16} /> 文件与题库
+        </button>
+        <button className={tab === 'ai' ? 'active' : ''} onClick={() => setTab('ai')}>
+          <Settings size={16} /> AI 接口
+        </button>
+        <button className={tab === 'translation' ? 'active' : ''} onClick={() => setTab('translation')}>
+          <BookOpen size={16} /> 翻译服务
+        </button>
       </div>
 
-      <div className="panel settings-card">
-        <div className="settings-head">
-          <div>
-            <span className="eyebrow">Question banks</span>
-            <h3>题库刷新</h3>
-          </div>
-          <button className="primary" onClick={props.onRefreshBanks}>
-            <RefreshCw size={16} /> 刷新
-          </button>
-        </div>
-        <div className="bank-mini-list">
-          {props.banks.length === 0 ? (
-            <div className="empty-state small">还没有识别到题库。</div>
-          ) : (
-            props.banks.map((bank) => (
-              <div className="bank-mini-row" key={bank.id}>
-                <strong>{bank.name}</strong>
-                <span>{bank.question_count} 题</span>
-                <em>{bank.pdf_path ? 'PDF 已匹配' : '缺少 PDF'}</em>
+      {tab === 'files' && (
+        <div className="settings-tab-body">
+          <div className="panel settings-card">
+            <div className="settings-head">
+              <h3>架构文件</h3>
+              <div className="action-row compact-actions">
+                <button onClick={props.onOpenDataDir}><FolderOpen size={16} /> 数据目录</button>
+                <button onClick={props.onOpenQuestionBanksDir}><FolderOpen size={16} /> 题库目录</button>
+                <button className="primary" onClick={props.onRefreshBanks}><RefreshCw size={16} /> 刷新</button>
               </div>
-            ))
-          )}
-        </div>
-        {props.message && <div className="info-box">{props.message}</div>}
-      </div>
-
-      <div className="panel settings-card">
-        <div className="settings-head">
-          <div>
-            <span className="eyebrow">Health check</span>
-            <h3>当前题库健康检查</h3>
+            </div>
+            <table className="file-table">
+              <tbody>
+                <tr><td className="ft-label">应用数据</td><td><code>{props.appPaths?.data_dir || '...'}</code></td></tr>
+                <tr><td className="ft-label">学习数据库</td><td><code>{props.appPaths?.app_db_path || '...'}</code></td></tr>
+                <tr><td className="ft-label">题库目录</td><td><code>{props.appPaths?.question_banks_dir || '...'}</code></td></tr>
+                <tr><td className="ft-label">PDF 缓存</td><td><code>{props.appPaths?.page_cache_dir || '...'}</code></td></tr>
+                {props.bankHealth?.translation_db_path && (
+                  <tr><td className="ft-label">翻译库</td><td><code>{props.bankHealth.translation_db_path}</code></td></tr>
+                )}
+              </tbody>
+            </table>
           </div>
-          <button onClick={props.onCheckHealth} disabled={!currentBank}>
-            <ShieldCheck size={16} /> 检查
-          </button>
-        </div>
-        <p className="muted">当前题库：{currentBank?.name || '无'}</p>
-        {props.bankHealth ? (
-          <div className="health-grid">
-            <Stat label="题目" value={props.bankHealth.question_count} />
-            <Stat label="空题干" value={props.bankHealth.empty_question_count} />
-            <Stat label="缺答案" value={props.bankHealth.empty_answer_count} />
-            <Stat label="缺页码" value={props.bankHealth.missing_page_count} />
-            <div className="health-warnings">
-              {props.bankHealth.warnings.map((warning) => (
-                <p key={warning}>{warning}</p>
-              ))}
+
+          <div className="settings-row-pair">
+            <div className="panel settings-card">
+              <div className="settings-head">
+                <h3>题库</h3>
+              </div>
+              {props.banks.length === 0 ? (
+                <div className="empty-state small">未识别到题库。</div>
+              ) : (
+                <div className="bank-mini-list">
+                  {props.banks.map((bank) => (
+                    <div className="bank-mini-row" key={bank.id}>
+                      <strong>{bank.name}</strong>
+                      <span>{bank.question_count} 题</span>
+                      <em>{bank.pdf_path ? 'PDF ✓' : '缺 PDF'}</em>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {props.message && <div className="info-box">{props.message}</div>}
+            </div>
+
+            <div className="panel settings-card">
+              <div className="settings-head">
+                <h3>健康检查</h3>
+                <button onClick={props.onCheckHealth} disabled={!currentBank}>
+                  <ShieldCheck size={16} /> 检查
+                </button>
+              </div>
+              {props.bankHealth ? (
+                <>
+                  <div className="health-grid">
+                    <Stat label="题目" value={props.bankHealth.question_count} />
+                    <Stat label="空题干" value={props.bankHealth.empty_question_count} />
+                    <Stat label="缺答案" value={props.bankHealth.empty_answer_count} />
+                    <Stat label="缺页码" value={props.bankHealth.missing_page_count} />
+                  </div>
+                  <div className="translation-health">
+                    <div className="translation-health-bar">
+                      <span>翻译进度</span>
+                      <strong>{props.bankHealth.translated_count} / {props.bankHealth.question_count}</strong>
+                    </div>
+                    <progress value={props.bankHealth.translated_count} max={props.bankHealth.question_count || 1} />
+                    {!props.bankHealth.translation_db_exists && (
+                      <p className="muted">尚未创建翻译库，前往「翻译服务」执行批量翻译。</p>
+                    )}
+                    {props.bankHealth.translation_db_exists && props.bankHealth.translated_count < props.bankHealth.question_count && (
+                      <p className="muted">还差 {props.bankHealth.question_count - props.bankHealth.translated_count} 题，建议前往「翻译服务」继续翻译。</p>
+                    )}
+                  </div>
+                  <div className="health-warnings">
+                    {props.bankHealth.warnings.map((w) => <p key={w}>{w}</p>)}
+                  </div>
+                </>
+              ) : (
+                <p className="muted">当前：{currentBank?.name || '无'}，点击检查查看详情。</p>
+              )}
             </div>
           </div>
-        ) : (
-          <div className="empty-state small">点击检查后显示题库状态。</div>
-        )}
-      </div>
+        </div>
+      )}
 
-      <div className="panel settings-card wide muted-card">
-        <div className="settings-head">
-          <div>
-            <span className="eyebrow">OpenAI-compatible Responses</span>
-            <h3>AI 接口设置</h3>
-          </div>
-          <button className="primary" onClick={() => props.onSaveAiSettings(draft)}>保存 AI 设置</button>
-        </div>
-        <label className="check-row">
-          <input type="checkbox" checked={draft.enabled} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} />
-          启用 AI 分析与 OpenAI 翻译
-        </label>
-        <div className="settings-form-grid">
-          <label>
-            Base URL
-            <input value={draft.base_url} onChange={(event) => setDraft({ ...draft, base_url: event.target.value })} placeholder="https://api.openai.com/v1" />
-          </label>
-          <label>
-            API Version（Azure/APIM 可选）
-            <input value={draft.api_version} onChange={(event) => setDraft({ ...draft, api_version: event.target.value })} placeholder="2025-03-01-preview" />
-          </label>
-          <label>
-            Model
-            <input value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} placeholder="gpt-4.1-mini" />
-          </label>
-          <label>
-            API Key
-            <input type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder="sk-..." />
-          </label>
-          <label>
-            Temperature
-            <input
-              type="number"
-              min={0}
-              max={2}
-              step={0.1}
-              value={draft.temperature}
-              onChange={(event) => setDraft({ ...draft, temperature: Number(event.target.value) })}
-            />
-          </label>
-        </div>
-        <p>
-          启用后，当前题目/选项/答案/解析会发送到你配置的 AI 服务。OpenAI 官方接口通常不填 API Version；Azure/APIM 网关通常需要填写。
-          Temperature 默认 0.7，更适合解释型分析；如需更保守稳定的答案核验，可降到 0.2–0.4。
-        </p>
-      </div>
-
-      <div className="panel settings-card wide muted-card">
-        <div className="settings-head">
-          <div>
-            <span className="eyebrow">Translation provider</span>
-            <h3>题目翻译服务</h3>
-          </div>
-          <div className="action-row compact-actions">
-            <button onClick={() => props.onTestTranslatorSettings(draft)}>测试 Microsoft Translator</button>
-            <button className="primary" onClick={() => props.onSaveAiSettings(draft)}>保存翻译设置</button>
-          </div>
-        </div>
-        <label>
-          翻译方式
-          <select
-            value={draft.translation_provider}
-            onChange={(event) => setDraft({ ...draft, translation_provider: event.target.value as AiSettings['translation_provider'] })}
-          >
-            <option value="ai">AI 翻译（走上方 OpenAI-compatible Responses）</option>
-            <option value="microsoft_translator">Microsoft Translator（Azure AI Translator）</option>
-          </select>
-        </label>
-        {draft.translation_provider === 'microsoft_translator' ? (
-          <>
+      {tab === 'ai' && (
+        <div className="settings-tab-body">
+          <div className="panel settings-card">
+            <div className="settings-head">
+              <h3>AI 接口设置</h3>
+              <button className="primary" onClick={() => props.onSaveAiSettings(draft)}>保存</button>
+            </div>
+            <label className="check-row">
+              <input type="checkbox" checked={draft.enabled} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} />
+              启用 AI 分析
+            </label>
             <div className="settings-form-grid">
+              <label title="OpenAI 官方或兼容接口的 Base URL">
+                Base URL
+                <input value={draft.base_url} onChange={(event) => setDraft({ ...draft, base_url: event.target.value })} placeholder="https://api.openai.com/v1" />
+              </label>
+              <label title="Azure OpenAI / APIM 网关需要填写；OpenAI 官方留空">
+                API Version（可选）
+                <input value={draft.api_version} onChange={(event) => setDraft({ ...draft, api_version: event.target.value })} placeholder="2025-03-01-preview" />
+              </label>
               <label>
-                Translator Endpoint
+                Model
+                <input value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} placeholder="gpt-4.1-mini" />
+              </label>
+              <label>
+                API Key
+                <input type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder="sk-..." />
+              </label>
+              <label title="0.7 适合解释分析；0.2–0.4 适合答案核验">
+                Temperature
                 <input
-                  value={draft.translator_endpoint}
-                  onChange={(event) => setDraft({ ...draft, translator_endpoint: event.target.value })}
-                  placeholder="https://api.cognitive.microsofttranslator.com 或 https://southeastasia.api.cognitive.microsoft.com"
+                  type="number"
+                  min={0}
+                  max={2}
+                  step={0.1}
+                  value={draft.temperature}
+                  onChange={(event) => setDraft({ ...draft, temperature: Number(event.target.value) })}
                 />
               </label>
-              <label>
-                Region
-                <input value={draft.translator_region} onChange={(event) => setDraft({ ...draft, translator_region: event.target.value })} placeholder="eastasia / eastus / ..." />
-              </label>
-              <label className="wide-field">
-                Translator Key
-                <input type="password" value={draft.translator_key} onChange={(event) => setDraft({ ...draft, translator_key: event.target.value })} placeholder="Azure Translator key" />
-              </label>
             </div>
-            <p>
-              选择 Microsoft Translator 后，题目翻译不再依赖 AI 开关，也不会调用大模型；它直接使用 Azure Translator Text API，速度更快，适合批量翻译题库。当前仅支持形如 https://southeastasia.api.cognitive.microsoft.com 的区域 Cognitive endpoint；Region 填 southeastasia。测试按钮会直接使用当前表单内容，不需要先保存。
+            <label className="wide-field" title="预置 System 提示词，控制 AI 回答风格。例如：只分析对错原因，不要废话；不要相信预置答案，自己判断。">
+              System 提示词（可选）
+              <textarea
+                rows={3}
+                value={draft.system_prompt}
+                onChange={(event) => setDraft({ ...draft, system_prompt: event.target.value })}
+                placeholder="例如：回答尽量简练，只说明为什么选这个、其他为什么错。不要相信预配答案，自己独立分析。"
+              />
+            </label>
+            <label className="wide-field" title={'点击「分析对错」按钮时使用的提示词模板。留空使用内置默认模板。'}>
+              「分析对错」提示词
+              <textarea
+                rows={3}
+                value={draft.prompt_analyze}
+                onChange={(event) => setDraft({ ...draft, prompt_analyze: event.target.value })}
+                placeholder="请用中文详细分析这道考试题。要求：1) 解释题干问什么；2) 解释正确答案为什么正确；3) 分析每个错误选项为什么错；4) 提炼知识点；5) 给出记忆方法。"
+              />
+            </label>
+            <label className="wide-field" title={'点击「总结题目」按钮时使用的提示词模板。留空使用内置默认模板。'}>
+              「总结题目」提示词
+              <textarea
+                rows={3}
+                value={draft.prompt_summarize}
+                onChange={(event) => setDraft({ ...draft, prompt_summarize: event.target.value })}
+                placeholder="请用中文简洁总结这道考试题。要求：1) 一句话概括题目在问什么；2) 正确答案是什么；3) 核心考点是什么；4) 关键词列表。不需要逐选项分析。"
+              />
+            </label>
+          </div>
+        </div>
+      )}
+
+      {tab === 'translation' && (
+        <div className="settings-tab-body">
+          <div className="panel settings-card">
+            <div className="settings-head">
+              <h3>翻译方式</h3>
+              <div className="action-row compact-actions">
+                {draft.translation_provider === 'microsoft_translator' && (
+                  <button onClick={() => props.onTestTranslatorSettings(draft)}>测试连接</button>
+                )}
+                <button className="primary" onClick={() => props.onSaveAiSettings(draft)}>保存</button>
+              </div>
+            </div>
+            <label>
+              <select
+                value={draft.translation_provider}
+                onChange={(event) => setDraft({ ...draft, translation_provider: event.target.value as AiSettings['translation_provider'] })}
+              >
+                <option value="ai">AI 翻译（复用 AI 接口）</option>
+                <option value="microsoft_translator">Microsoft Translator（Azure）</option>
+              </select>
+            </label>
+            {draft.translation_provider === 'microsoft_translator' ? (
+              <div className="settings-form-grid">
+                <label title="固定使用 https://api.cognitive.microsofttranslator.com/">
+                  Endpoint
+                  <input
+                    value={draft.translator_endpoint}
+                    onChange={(event) => setDraft({ ...draft, translator_endpoint: event.target.value })}
+                    placeholder="https://api.cognitive.microsofttranslator.com/"
+                  />
+                </label>
+                <label title="Azure 门户中 Translator 资源的位置/区域。区域型资源必填，全局资源可留空">
+                  Region（区域型资源必填）
+                  <input value={draft.translator_region} onChange={(event) => setDraft({ ...draft, translator_region: event.target.value })} placeholder="swedencentral" />
+                </label>
+                <label className="wide-field">
+                  Translator Key
+                  <input type="password" value={draft.translator_key} onChange={(event) => setDraft({ ...draft, translator_key: event.target.value })} placeholder="Azure Translator 密钥" />
+                </label>
+              </div>
+            ) : (
+              <div className="info-box">将复用 AI 接口配置进行翻译。</div>
+            )}
+          </div>
+
+          <div className="panel settings-card">
+            <div className="settings-head">
+              <h3>全题库批量翻译</h3>
+              <button className="primary" onClick={props.onBatchTranslate} disabled={!currentBank || props.batchTranslationBusy}>
+                {props.batchTranslationBusy ? '翻译中...' : '开始翻译'}
+              </button>
+            </div>
+            <p className="muted" title="翻译结果写入 .translations.sqlite，中断后可继续">
+              逐题翻译当前题库，自动跳过已完成的题目。
             </p>
-          </>
-        ) : (
-          <div className="info-box">当前选择 AI 翻译，将复用上方 OpenAI-compatible Responses 配置；无需填写 Microsoft Translator Endpoint、Region 或 Key。</div>
-        )}
-      </div>
+            {props.batchTranslation ? (
+              <div className="batch-progress-box">
+                <div className="batch-progress-head">
+                  <strong>{batchProgressPercent}%</strong>
+                  <span>{props.batchTranslation.current_index} / {props.batchTranslation.total} 题</span>
+                </div>
+                <progress value={props.batchTranslation.current_index} max={props.batchTranslation.total || 1} />
+                <p>{props.batchTranslation.message}</p>
+                <div className="batch-progress-stats">
+                  <span>新翻译：{props.batchTranslation.translated}</span>
+                  <span>已跳过：{props.batchTranslation.skipped}</span>
+                  <span>失败：{props.batchTranslation.failed}</span>
+                </div>
+              </div>
+            ) : (
+              <div className="empty-state small">点击按钮后显示进度</div>
+            )}
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -1191,7 +1310,7 @@ function QuestionPanel(props: {
   onReturn?: () => void;
   onToggleFlag?: (flagType: string) => void;
   onAiPrompt?: (value: string) => void;
-  onAskAi?: () => void;
+  onAskAi?: (actionType: 'analyze' | 'summarize' | 'freeform') => void;
   onTranslationMode?: (value: TranslationMode) => void;
   onTranslationLanguage?: (value: string) => void;
   onTranslate?: (force: boolean) => void;
@@ -1302,6 +1421,16 @@ function QuestionPanel(props: {
           <button onClick={props.onLoadPages} disabled={props.pagesBusy}>
             <FileText size={16} /> {props.pagesBusy ? '加载中...' : '加载 PDF 对应页'}
           </button>
+          {!props.compact && props.onAskAi && (
+            <>
+              <button disabled={!(props.aiEnabled) || (props.aiBusy ?? false)} onClick={() => props.onAskAi!('analyze')}>
+                {props.aiBusy ? '生成中...' : 'AI 分析对错'}
+              </button>
+              <button disabled={!(props.aiEnabled) || (props.aiBusy ?? false)} onClick={() => props.onAskAi!('summarize')}>
+                AI 总结
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -1332,7 +1461,6 @@ function QuestionPanel(props: {
           prompt={props.aiPrompt || ''}
           answer={props.aiAnswer || ''}
           busy={props.aiBusy ?? false}
-          chunkCount={props.aiStreamChunkCount ?? 0}
           onPrompt={props.onAiPrompt}
           onAsk={props.onAskAi}
         />
@@ -1430,19 +1558,12 @@ function TranslationPanel(props: {
   );
 }
 
-function AiPanel(props: { enabled: boolean; prompt: string; answer: string; busy: boolean; chunkCount: number; onPrompt: (value: string) => void; onAsk: () => void }) {
+function AiPanel(props: { enabled: boolean; prompt: string; answer: string; busy: boolean; onPrompt: (value: string) => void; onAsk: (actionType: 'analyze' | 'summarize' | 'freeform') => void }) {
   return (
     <section className="ai-panel">
-      <div className="panel-headline">
-        <div>
-          <h4>AI 题目助手</h4>
-          <p className="muted">Channel 真流式 · Markdown 渲染 · {props.chunkCount} chunks</p>
-        </div>
-        {props.busy && <span className="stream-pill">正在生成</span>}
-      </div>
-      {!props.enabled && <div className="info-box">请先在控制面板启用 AI 并保存 OpenAI 兼容接口配置。</div>}
+      {!props.enabled && <div className="info-box">请先在控制面板启用 AI 并保存配置。</div>}
       <div className="ai-chat-shell">
-        {props.answer ? (
+        {props.answer && (
           <div className="ai-message assistant">
             <div className="ai-avatar">AI</div>
             <div className="markdown-body ai-answer">
@@ -1450,14 +1571,12 @@ function AiPanel(props: { enabled: boolean; prompt: string; answer: string; busy
               {props.busy && <span className="stream-cursor" aria-hidden="true" />}
             </div>
           </div>
-        ) : (
-          <div className="ai-empty-state">输入追问后点击分析，回答会在这里按 Markdown 流式出现。</div>
         )}
       </div>
       <div className="ai-input-bar">
-        <textarea value={props.prompt} onChange={(event) => props.onPrompt(event.target.value)} placeholder="可输入追问，例如：为什么 B 不对？" />
-        <button className="primary" disabled={!props.enabled || props.busy} onClick={props.onAsk}>
-          {props.busy ? '生成中...' : '分析当前题'}
+        <textarea value={props.prompt} onChange={(event) => props.onPrompt(event.target.value)} placeholder={'输入问题，例如：为什么 B 不对？'} />
+        <button className="primary" disabled={!props.enabled || props.busy} onClick={() => props.onAsk('freeform')}>
+          提问
         </button>
       </div>
     </section>

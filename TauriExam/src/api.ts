@@ -5,6 +5,9 @@ import type {
   AiSettings,
   AiStreamEvent,
   AppPaths,
+  BatchTranslateEvent,
+  BatchTranslateInput,
+  BatchTranslateResult,
   BankHealth,
   BankInfo,
   ExamAnswerDetail,
@@ -50,6 +53,13 @@ export const api = {
   getCachedTranslations: (bankId: string, questionId: string, language: string) =>
     invoke<TranslationRow[]>('get_cached_translations', { bankId, questionId, language }),
   translateQuestion: (input: TranslateQuestionInput) => invoke<TranslationRow[]>('translate_question', { input }),
+  createBatchTranslateChannel: (onMessage: (event: BatchTranslateEvent) => void) => {
+    const channel = new Channel<BatchTranslateEvent>();
+    channel.onmessage = onMessage;
+    return channel;
+  },
+  batchTranslateBank: (input: BatchTranslateInput, onEvent: Channel<BatchTranslateEvent>) =>
+    invoke<BatchTranslateResult>('batch_translate_bank', { input, onEvent }),
   listQuestions: (bankId: string) => invoke<QuestionSummary[]>('list_questions', { bankId }),
   getQuestion: (bankId: string, questionId: string) =>
     invoke<QuestionDetail>('get_question', { bankId, questionId }),

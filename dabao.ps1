@@ -1,5 +1,6 @@
 param(
-    [switch]$NoRun
+    [switch]$NoRun,
+    [switch]$Full
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +26,11 @@ Write-Host '==> Closing running TauriExam release process if needed...'
 Get-Process -Name 'tauri-exam' -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $ExePath } |
     Stop-Process -Force
+
+if ($Full) {
+    Write-Host '==> Full rebuild: cleaning Rust target...'
+    cargo clean --manifest-path (Join-Path $TauriDir 'Cargo.toml') --release
+}
 
 Write-Host '==> Building release exe only (no installer bundle; includes frontend build)...'
 npm --prefix $AppDir run tauri -- build --no-bundle

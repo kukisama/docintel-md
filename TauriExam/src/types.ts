@@ -24,6 +24,9 @@ export type BankHealth = {
   missing_page_count: number;
   max_question_page: number | null;
   pdf_page_count: number | null;
+  translation_db_path: string;
+  translation_db_exists: boolean;
+  translated_count: number;
   warnings: string[];
 };
 
@@ -85,6 +88,9 @@ export type AiSettings = {
   api_key: string;
   model: string;
   temperature: number;
+  system_prompt: string;
+  prompt_analyze: string;
+  prompt_summarize: string;
   translation_provider: 'ai' | 'microsoft_translator';
   translator_endpoint: string;
   translator_key: string;
@@ -95,6 +101,7 @@ export type AiQuestionRequest = {
   bank_id: string;
   question_id: string;
   user_prompt?: string | null;
+  action_type?: 'analyze' | 'summarize' | 'freeform' | null;
 };
 
 export type AiResponseResult = {
@@ -113,6 +120,36 @@ export type TranslateQuestionInput = {
   question_id: string;
   language: string;
   force: boolean;
+};
+
+export type BatchTranslateInput = {
+  bank_id: string;
+  language: string;
+  force: boolean;
+};
+
+export type BatchTranslateEvent = {
+  bank_id: string;
+  translation_db_path: string;
+  current_index: number;
+  total: number;
+  translated: number;
+  skipped: number;
+  failed: number;
+  current_question_id: string | null;
+  current_sequence_number: number | null;
+  message: string;
+  done: boolean;
+  error: string | null;
+};
+
+export type BatchTranslateResult = {
+  bank_id: string;
+  translation_db_path: string;
+  total: number;
+  translated: number;
+  skipped: number;
+  failed: number;
 };
 
 export type TranslationRow = {

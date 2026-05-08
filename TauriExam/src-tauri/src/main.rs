@@ -3,7 +3,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use pdfium_render::prelude::*;
-use reqwest::blocking::Client;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -49,6 +48,9 @@ struct BankHealth {
     missing_page_count: i64,
     max_question_page: Option<i64>,
     pdf_page_count: Option<i64>,
+    translation_db_path: String,
+    translation_db_exists: bool,
+    translated_count: i64,
     warnings: Vec<String>,
 }
 
@@ -243,6 +245,9 @@ struct AiSettings {
     api_key: String,
     model: String,
     temperature: f32,
+    system_prompt: String,
+    prompt_analyze: String,
+    prompt_summarize: String,
     translation_provider: String,
     translator_endpoint: String,
     translator_key: String,
@@ -254,6 +259,7 @@ struct AiQuestionRequest {
     bank_id: String,
     question_id: String,
     user_prompt: Option<String>,
+    action_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -277,6 +283,13 @@ struct TranslateQuestionInput {
     force: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct BatchTranslateInput {
+    bank_id: String,
+    language: String,
+    force: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct TranslationRow {
     field_name: String,
@@ -293,6 +306,32 @@ struct TranslationRow {
 struct TranslatorTestResult {
     source_text: String,
     translated_text: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct BatchTranslateEvent {
+    bank_id: String,
+    translation_db_path: String,
+    current_index: i64,
+    total: i64,
+    translated: i64,
+    skipped: i64,
+    failed: i64,
+    current_question_id: Option<String>,
+    current_sequence_number: Option<i64>,
+    message: String,
+    done: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchTranslateResult {
+    bank_id: String,
+    translation_db_path: String,
+    total: i64,
+    translated: i64,
+    skipped: i64,
+    failed: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +533,9 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> 
     .map_err(|err| err.to_string())
 }
 
+const DEFAULT_PROMPT_ANALYZE: &str = "请用中文详细分析这道考试题。要求：1) 解释题干问什么；2) 解释正确答案为什么正确；3) 分析每个错误选项为什么错；4) 提炼知识点；5) 给出记忆方法。";
+const DEFAULT_PROMPT_SUMMARIZE: &str = "请用中文简洁总结这道考试题。要求：1) 一句话概括题目在问什么；2) 正确答案是什么；3) 核心考点是什么；4) 关键词列表。不需要逐选项分析。";
+
 fn default_ai_settings() -> AiSettings {
     AiSettings {
         enabled: false,
@@ -502,6 +544,9 @@ fn default_ai_settings() -> AiSettings {
         api_key: String::new(),
         model: "gpt-4.1-mini".to_string(),
         temperature: 0.7,
+        system_prompt: String::new(),
+        prompt_analyze: DEFAULT_PROMPT_ANALYZE.to_string(),
+        prompt_summarize: DEFAULT_PROMPT_SUMMARIZE.to_string(),
         translation_provider: "ai".to_string(),
         translator_endpoint: "https://api.cognitive.microsofttranslator.com".to_string(),
         translator_key: String::new(),
@@ -521,6 +566,9 @@ fn load_ai_settings() -> Result<AiSettings, String> {
         temperature: get_setting(&conn, "ai.temperature")?
             .and_then(|value| value.parse::<f32>().ok())
             .unwrap_or(defaults.temperature),
+        system_prompt: get_setting(&conn, "ai.system_prompt")?.unwrap_or(defaults.system_prompt),
+        prompt_analyze: get_setting(&conn, "ai.prompt_analyze")?.unwrap_or(defaults.prompt_analyze),
+        prompt_summarize: get_setting(&conn, "ai.prompt_summarize")?.unwrap_or(defaults.prompt_summarize),
         translation_provider: get_setting(&conn, "translation.provider")?.unwrap_or(defaults.translation_provider),
         translator_endpoint: get_setting(&conn, "translator.endpoint")?.unwrap_or(defaults.translator_endpoint),
         translator_key: get_setting(&conn, "translator.key")?.unwrap_or(defaults.translator_key),
@@ -578,28 +626,30 @@ fn call_responses_api(settings: &AiSettings, prompt: &str) -> Result<String, Str
             api_version
         )
     };
-    let client = http_client()?;
-    let mut request = client
-        .post(url)
-        .json(&json!({
-            "model": settings.model,
-            "temperature": settings.temperature,
-            "input": prompt
-        }));
+    let agent = http_agent();
+    let mut body = json!({
+        "model": settings.model,
+        "temperature": settings.temperature,
+        "input": prompt
+    });
+    if !settings.system_prompt.trim().is_empty() {
+        body["instructions"] = json!(settings.system_prompt.trim());
+    }
+    let mut request = agent.post(&url);
     request = if api_version.is_empty() {
-        request.bearer_auth(settings.api_key.trim())
+        request.set("Authorization", &format!("Bearer {}", settings.api_key.trim()))
     } else {
-        request.header("api-key", settings.api_key.trim())
+        request.set("api-key", settings.api_key.trim())
     };
     let response = request
-        .send()
-        .map_err(request_error_message)?;
+        .send_json(&body)
+        .map_err(|err| err.to_string())?;
     let status = response.status();
-    let body: Value = response.json().map_err(|err| err.to_string())?;
-    if !status.is_success() {
-        return Err(format!("AI 请求失败 ({status}): {body}"));
+    let response_body: Value = response.into_json().map_err(|err| err.to_string())?;
+    if status < 200 || status >= 300 {
+        return Err(format!("AI 请求失败 ({status}): {response_body}"));
     }
-    extract_response_text(&body).ok_or_else(|| format!("AI 响应中未找到文本内容: {body}"))
+    extract_response_text(&response_body).ok_or_else(|| format!("AI 响应中未找到文本内容: {response_body}"))
 }
 
 fn call_responses_api_stream<F>(settings: &AiSettings, prompt: &str, mut on_delta: F) -> Result<String, String>
@@ -622,30 +672,33 @@ where
             api_version
         )
     };
-    let client = http_client()?;
-    let mut request = client
-        .post(url)
-        .header("Accept", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .json(&json!({
-            "model": settings.model,
-            "temperature": settings.temperature,
-            "input": prompt,
-            "stream": true
-        }));
+    let agent = http_agent();
+    let mut body = json!({
+        "model": settings.model,
+        "temperature": settings.temperature,
+        "input": prompt,
+        "stream": true
+    });
+    if !settings.system_prompt.trim().is_empty() {
+        body["instructions"] = json!(settings.system_prompt.trim());
+    }
+    let mut request = agent
+        .post(&url)
+        .set("Accept", "text/event-stream")
+        .set("Cache-Control", "no-cache");
     request = if api_version.is_empty() {
-        request.bearer_auth(settings.api_key.trim())
+        request.set("Authorization", &format!("Bearer {}", settings.api_key.trim()))
     } else {
-        request.header("api-key", settings.api_key.trim())
+        request.set("api-key", settings.api_key.trim())
     };
-    let response = request.send().map_err(request_error_message)?;
+    let response = request.send_json(&body).map_err(|err| err.to_string())?;
     let status = response.status();
-    if !status.is_success() {
-        let body = response.text().unwrap_or_default();
+    if status < 200 || status >= 300 {
+        let body = response.into_string().unwrap_or_default();
         return Err(format!("AI 请求失败 ({status}): {body}"));
     }
     let mut content = String::new();
-    let reader = BufReader::new(response);
+    let reader = BufReader::new(response.into_reader());
     for line in reader.lines() {
         let line = line.map_err(|err| err.to_string())?;
         let Some(data) = line.strip_prefix("data:") else {
@@ -675,23 +728,10 @@ where
     Ok(content)
 }
 
-fn http_client() -> Result<Client, String> {
-    Client::builder()
-        .use_native_tls()
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(120))
         .build()
-        .map_err(|err| err.to_string())
-}
-
-fn request_error_message(err: reqwest::Error) -> String {
-    let mut message = err.to_string();
-    let mut source = std::error::Error::source(&err);
-    while let Some(err) = source {
-        message.push_str("; caused by: ");
-        message.push_str(&err.to_string());
-        source = err.source();
-    }
-    message
 }
 
 fn extract_stream_delta(value: &Value) -> Option<String> {
@@ -747,33 +787,70 @@ fn call_translator_batch_api(settings: &AiSettings, segments: &[TranslationSegme
     if settings.translator_key.trim().is_empty() {
         return Err("Microsoft Translator Key 为空，请先在控制面板填写。".to_string());
     }
+    let key_diagnostics = translator_key_diagnostics(&settings.translator_key);
+    if !key_diagnostics.looks_like_azure_key {
+        return Err(format!("Microsoft Translator Key 看起来不是有效 Azure key（{}）。请重新粘贴 Azure 门户 Keys and Endpoint 里的 Key1 或 Key2。", key_diagnostics.summary()));
+    }
     if segments.is_empty() {
         return Ok(Vec::new());
     }
     let target = translator_language(language);
     let translator_region = translator_region_for_config(settings)?;
     let url = translator_url_with_target("https://api.cognitive.microsofttranslator.com/translate", &target);
-    let client = Client::builder().build().map_err(|err| err.to_string())?;
+    let agent = http_agent();
     let body = segments
         .iter()
         .map(|segment| json!({ "Text": segment.source_text }))
         .collect::<Vec<_>>();
-    let response = client
+    let response = agent
         .post(&url)
-        .header("Ocp-Apim-Subscription-Key", settings.translator_key.trim())
-        .header("Ocp-Apim-Subscription-Region", translator_region)
-        .header("Content-Type", "application/json; charset=UTF-8")
-        .json(&body)
-        .send()
+        .set("Ocp-Apim-Subscription-Key", settings.translator_key.trim())
+        .set("Ocp-Apim-Subscription-Region", translator_region.as_str())
+        .set("Content-Type", "application/json; charset=UTF-8")
+        .send_json(&json!(body))
         .map_err(|err| err.to_string())?;
     let status = response.status();
-    let response_text = response.text().map_err(|err| err.to_string())?;
+    let response_text = response.into_string().map_err(|err| err.to_string())?;
     let response_body: Value = serde_json::from_str(&response_text)
         .map_err(|err| format!("Microsoft Translator 响应不是合法 JSON ({status}): {err}; 原文: {response_text}"))?;
-    if !status.is_success() {
-        return Err(format!("Microsoft Translator 请求失败 ({status})，endpoint 必须填写类似 https://southeastasia.api.cognitive.microsoft.com，region 必须是 southeastasia。响应: {response_body}"));
+    if status < 200 || status >= 300 {
+        return Err(format!("Microsoft Translator 请求失败 ({status})，已按官方 Text Translation REST 方式请求 https://api.cognitive.microsofttranslator.com/translate，并传入 Ocp-Apim-Subscription-Key 与 Ocp-Apim-Subscription-Region；key 诊断：{}；响应: {response_body}", key_diagnostics.summary()));
     }
     parse_translator_response(&response_body)
+}
+
+struct TranslatorKeyDiagnostics {
+    len: usize,
+    is_ascii: bool,
+    has_password_bullets: bool,
+    has_inner_whitespace: bool,
+    has_key_label_chars: bool,
+    only_token_chars: bool,
+    looks_like_azure_key: bool,
+}
+
+impl TranslatorKeyDiagnostics {
+    fn summary(&self) -> String {
+        format!(
+            "len={}, ascii={}, contains_password_bullets={}, azure_key_shape={}",
+            self.len, self.is_ascii, self.has_password_bullets, self.looks_like_azure_key
+        ) + &format!(
+            ", inner_whitespace={}, label_chars={}, token_chars_only={}",
+            self.has_inner_whitespace, self.has_key_label_chars, self.only_token_chars
+        )
+    }
+}
+
+fn translator_key_diagnostics(key: &str) -> TranslatorKeyDiagnostics {
+    let trimmed = key.trim();
+    let len = trimmed.chars().count();
+    let is_ascii = trimmed.is_ascii();
+    let has_password_bullets = trimmed.contains('•') || trimmed.contains('●') || trimmed.contains('*');
+    let has_inner_whitespace = trimmed.chars().any(char::is_whitespace);
+    let has_key_label_chars = trimmed.contains(':');
+    let only_token_chars = trimmed.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '=' || ch == '-' || ch == '_');
+    let looks_like_azure_key = len >= 20 && len <= 128 && is_ascii && !has_password_bullets && !has_inner_whitespace && !has_key_label_chars && only_token_chars;
+    TranslatorKeyDiagnostics { len, is_ascii, has_password_bullets, has_inner_whitespace, has_key_label_chars, only_token_chars, looks_like_azure_key }
 }
 
 fn translator_url_with_target(base: &str, target: &str) -> String {
@@ -788,27 +865,24 @@ fn translator_url_with_target(base: &str, target: &str) -> String {
 }
 
 fn translator_region_for_config(settings: &AiSettings) -> Result<String, String> {
-    let endpoint_region = translator_region_from_endpoint(&settings.translator_endpoint);
-    let region = if settings.translator_region.trim().is_empty() {
-        endpoint_region.as_deref().unwrap_or_default()
-    } else {
-        settings.translator_region.trim()
-    };
+    let region = settings.translator_region.trim();
     if region.is_empty() {
-        return Err("Microsoft Translator Region 为空；当前只支持类似 https://southeastasia.api.cognitive.microsoft.com + southeastasia 的配置。".to_string());
+        return Err("Microsoft Translator Region 为空；请填写 Azure 门户“位置/区域”里的资源区域，例如 swedencentral。".to_string());
     }
-    if translator_region_from_endpoint(&settings.translator_endpoint).is_none() {
-        return Err("Microsoft Translator Endpoint 格式不支持；当前只支持类似 https://southeastasia.api.cognitive.microsoft.com 的区域 Cognitive endpoint。".to_string());
+    if !is_supported_translator_endpoint(&settings.translator_endpoint) {
+        return Err("Microsoft Translator Endpoint 格式不支持；当前只支持官方 Text Translation endpoint：https://api.cognitive.microsofttranslator.com/。".to_string());
     }
     Ok(region.to_string())
 }
 
-fn translator_region_from_endpoint(endpoint: &str) -> Option<String> {
+fn is_supported_translator_endpoint(endpoint: &str) -> bool {
+    let host = normalized_endpoint_host(endpoint);
+    host == "api.cognitive.microsofttranslator.com"
+}
+
+fn normalized_endpoint_host(endpoint: &str) -> String {
     let endpoint = endpoint.trim().trim_start_matches("https://").trim_start_matches("http://");
-    let host = endpoint.split('/').next().unwrap_or_default().to_lowercase();
-    host.strip_suffix(".api.cognitive.microsoft.com")
-        .filter(|region| !region.is_empty())
-        .map(ToString::to_string)
+    endpoint.split('/').next().unwrap_or_default().to_lowercase()
 }
 
 fn parse_translator_response(body: &Value) -> Result<Vec<String>, String> {
@@ -827,6 +901,7 @@ fn parse_translator_response(body: &Value) -> Result<Vec<String>, String> {
     Ok(translations)
 }
 
+#[cfg(test)]
 fn sanitized_translator_url_path(url: &str) -> String {
     let without_scheme = url.split_once("://").map(|(_, right)| right).unwrap_or(url);
     let (host, path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
@@ -950,6 +1025,61 @@ fn app_db_path() -> Result<PathBuf, String> {
 fn open_bank(bank_id: &str) -> Result<Connection, String> {
     let path = bank_db_path(bank_id)?;
     Connection::open(&path).map_err(|err| format!("Failed to open {}: {err}", path.display()))
+}
+
+fn translation_db_path_for_bank(bank: &BankEntry) -> Result<PathBuf, String> {
+    let file_stem = bank
+        .db_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("无法从题库路径生成翻译库文件名：{}", bank.db_path.display()))?;
+    Ok(bank.db_path.with_file_name(format!("{file_stem}.translations.sqlite")))
+}
+
+fn open_translation_db(bank_id: &str) -> Result<(Connection, PathBuf), String> {
+    let bank = find_bank(bank_id)?;
+    let path = translation_db_path_for_bank(&bank)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let conn = Connection::open(&path).map_err(|err| format!("Failed to open {}: {err}", path.display()))?;
+    init_translation_schema(&conn)?;
+    Ok((conn, path))
+}
+
+fn init_translation_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS translation_segments (
+          id TEXT PRIMARY KEY,
+          bank_id TEXT NOT NULL,
+          question_id TEXT NOT NULL,
+          field_name TEXT NOT NULL,
+          segment_index INTEGER NOT NULL,
+          source_hash TEXT NOT NULL,
+          language TEXT NOT NULL,
+          translated_text TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          version INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_translation_segments_lookup
+        ON translation_segments(bank_id, question_id, language, field_name, segment_index, version);
+
+        CREATE INDEX IF NOT EXISTS idx_translation_segments_resume
+        ON translation_segments(bank_id, question_id, language, field_name, segment_index, source_hash);
+
+        CREATE TABLE IF NOT EXISTS translation_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .map_err(|err| err.to_string())
 }
 
 fn open_app_db() -> Result<Connection, String> {
@@ -1125,6 +1255,26 @@ fn check_bank_health(bank_id: String) -> Result<BankHealth, String> {
         .unwrap_or(0);
     let max_question_page = conn.query_row("SELECT max(page_to) FROM questions", [], |row| row.get(0)).unwrap_or(None);
 
+    // Check translation database
+    let trans_path = translation_db_path_for_bank(&bank)?;
+    let trans_path_str = trans_path.display().to_string();
+    let translation_db_exists = trans_path.exists();
+    let translated_count: i64 = if translation_db_exists {
+        if let Ok(tconn) = Connection::open(&trans_path) {
+            tconn
+                .query_row(
+                    "SELECT COUNT(DISTINCT question_id) FROM translation_segments WHERE bank_id = ?1",
+                    [&bank.id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     let mut warnings = Vec::new();
     if bank.pdf_path.is_none() {
         warnings.push("未找到同名 PDF，可以继续刷题，但无法加载原文页。".to_string());
@@ -1141,6 +1291,16 @@ fn check_bank_health(bank_id: String) -> Result<BankHealth, String> {
     if warnings.is_empty() {
         warnings.push("题库基础检查通过。".to_string());
     }
+    let remaining = question_count - translated_count;
+    if translation_db_exists {
+        if remaining > 0 {
+            warnings.push(format!("翻译库还差 {remaining} 题未翻译，建议前往「翻译服务」执行批量翻译。"));
+        } else {
+            warnings.push("翻译库已完整覆盖所有题目。".to_string());
+        }
+    } else {
+        warnings.push("尚未创建翻译库，可前往「翻译服务」执行批量翻译。".to_string());
+    }
 
     Ok(BankHealth {
         bank_id,
@@ -1152,6 +1312,9 @@ fn check_bank_health(bank_id: String) -> Result<BankHealth, String> {
         missing_page_count,
         max_question_page,
         pdf_page_count: None,
+        translation_db_path: trans_path_str,
+        translation_db_exists,
+        translated_count,
         warnings,
     })
 }
@@ -1842,6 +2005,9 @@ fn save_ai_settings(settings: AiSettings) -> Result<AiSettings, String> {
     set_setting(&conn, "ai.api_key", &settings.api_key)?;
     set_setting(&conn, "ai.model", &settings.model)?;
     set_setting(&conn, "ai.temperature", &settings.temperature.to_string())?;
+    set_setting(&conn, "ai.system_prompt", &settings.system_prompt)?;
+    set_setting(&conn, "ai.prompt_analyze", &settings.prompt_analyze)?;
+    set_setting(&conn, "ai.prompt_summarize", &settings.prompt_summarize)?;
     set_setting(&conn, "translation.provider", &settings.translation_provider)?;
     set_setting(&conn, "translator.endpoint", &settings.translator_endpoint)?;
     set_setting(&conn, "translator.key", &settings.translator_key)?;
@@ -1875,7 +2041,7 @@ async fn ask_ai_about_question(input: AiQuestionRequest) -> Result<AiResponseRes
 fn ask_ai_about_question_blocking(input: AiQuestionRequest) -> Result<AiResponseResult, String> {
     let settings = load_ai_settings()?;
     let question = get_question(input.bank_id.clone(), input.question_id.clone())?;
-    let prompt = ai_question_prompt(&input, &question);
+    let prompt = ai_question_prompt(&input, &question, &settings);
     let content = call_responses_api(&settings, &prompt)?;
     save_ai_exchange(&input.bank_id, &input.question_id, &settings, &prompt, &content)?;
     Ok(AiResponseResult { content })
@@ -1892,7 +2058,7 @@ fn ask_ai_about_question_stream_blocking(input: AiQuestionRequest, on_event: Cha
     let question_id = input.question_id.clone();
     let settings = load_ai_settings()?;
     let question = get_question(input.bank_id.clone(), input.question_id.clone())?;
-    let prompt = ai_question_prompt(&input, &question);
+    let prompt = ai_question_prompt(&input, &question, &settings);
     let result = call_responses_api_stream(&settings, &prompt, |delta| {
         on_event
             .send(AiStreamEvent {
@@ -1939,12 +2105,40 @@ fn ask_ai_about_question_stream_blocking(input: AiQuestionRequest, on_event: Cha
     }
 }
 
-fn ai_question_prompt(input: &AiQuestionRequest, question: &QuestionDetail) -> String {
-    format!(
-        "请用中文详细分析这道考试题。要求：1) 解释题干问什么；2) 解释正确答案为什么正确；3) 分析每个错误选项为什么错；4) 提炼知识点；5) 给出记忆方法。\n\n用户追问或补充：{}\n\n题目上下文：\n{}",
-        input.user_prompt.clone().unwrap_or_else(|| "请进行完整分析。".to_string()),
-        question_context(question)
-    )
+fn ai_question_prompt(input: &AiQuestionRequest, question: &QuestionDetail, settings: &AiSettings) -> String {
+    let action = input.action_type.as_deref().unwrap_or("analyze");
+    match action {
+        "summarize" => {
+            let template = if settings.prompt_summarize.trim().is_empty() {
+                DEFAULT_PROMPT_SUMMARIZE
+            } else {
+                settings.prompt_summarize.trim()
+            };
+            format!("{template}\n\n题目上下文：\n{}", question_context(question))
+        }
+        "freeform" => {
+            let user_text = input.user_prompt.as_deref().unwrap_or("").trim();
+            if user_text.is_empty() {
+                format!("请帮我看看这道题。\n\n题目上下文：\n{}", question_context(question))
+            } else {
+                format!("{user_text}\n\n题目上下文：\n{}", question_context(question))
+            }
+        }
+        _ => {
+            // "analyze" — default
+            let template = if settings.prompt_analyze.trim().is_empty() {
+                DEFAULT_PROMPT_ANALYZE
+            } else {
+                settings.prompt_analyze.trim()
+            };
+            let user_extra = input.user_prompt.as_deref().unwrap_or("").trim();
+            if user_extra.is_empty() {
+                format!("{template}\n\n题目上下文：\n{}", question_context(question))
+            } else {
+                format!("{template}\n\n用户追问或补充：{user_extra}\n\n题目上下文：\n{}", question_context(question))
+            }
+        }
+    }
 }
 
 fn save_ai_exchange(bank_id: &str, question_id: &str, settings: &AiSettings, prompt: &str, content: &str) -> Result<(), String> {
@@ -1976,6 +2170,241 @@ async fn translate_question(input: TranslateQuestionInput) -> Result<Vec<Transla
     tauri::async_runtime::spawn_blocking(move || translate_question_blocking(input))
         .await
         .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn batch_translate_bank(input: BatchTranslateInput, on_event: Channel<BatchTranslateEvent>) -> Result<BatchTranslateResult, String> {
+    tauri::async_runtime::spawn_blocking(move || batch_translate_bank_blocking(input, on_event))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn batch_translate_bank_blocking(input: BatchTranslateInput, on_event: Channel<BatchTranslateEvent>) -> Result<BatchTranslateResult, String> {
+    let settings = load_ai_settings()?;
+    let questions = list_questions(input.bank_id.clone())?;
+    let total = questions.len() as i64;
+    let (conn, translation_db_path) = open_translation_db(&input.bank_id)?;
+    let translation_db_path_text = translation_db_path.display().to_string();
+    let mut translated = 0_i64;
+    let mut skipped = 0_i64;
+    let mut failed = 0_i64;
+
+    send_batch_translate_event(
+        &on_event,
+        BatchTranslateEvent {
+            bank_id: input.bank_id.clone(),
+            translation_db_path: translation_db_path_text.clone(),
+            current_index: 0,
+            total,
+            translated,
+            skipped,
+            failed,
+            current_question_id: None,
+            current_sequence_number: None,
+            message: format!("准备批量翻译，共 {total} 题。"),
+            done: false,
+            error: None,
+        },
+    );
+
+    for (index, summary) in questions.iter().enumerate() {
+        let current_index = index as i64 + 1;
+        let question = get_question(input.bank_id.clone(), summary.id.clone())?;
+        let segments = translation_segments_from_question(&question);
+
+        if !input.force && translation_package_has_current_segments(&conn, &input.bank_id, &summary.id, &input.language, &segments)? {
+            skipped += 1;
+            send_batch_translate_event(
+                &on_event,
+                BatchTranslateEvent {
+                    bank_id: input.bank_id.clone(),
+                    translation_db_path: translation_db_path_text.clone(),
+                    current_index,
+                    total,
+                    translated,
+                    skipped,
+                    failed,
+                    current_question_id: Some(summary.id.clone()),
+                    current_sequence_number: Some(summary.sequence_number),
+                    message: format!("第 {current_index}/{total} 题已存在翻译，跳过。"),
+                    done: false,
+                    error: None,
+                },
+            );
+            continue;
+        }
+
+        send_batch_translate_event(
+            &on_event,
+            BatchTranslateEvent {
+                bank_id: input.bank_id.clone(),
+                translation_db_path: translation_db_path_text.clone(),
+                current_index,
+                total,
+                translated,
+                skipped,
+                failed,
+                current_question_id: Some(summary.id.clone()),
+                current_sequence_number: Some(summary.sequence_number),
+                message: format!("正在翻译第 {current_index}/{total} 题（Q{}）...", summary.sequence_number),
+                done: false,
+                error: None,
+            },
+        );
+
+        if input.force {
+            clear_translation_rows_in_conn(&conn, &input.bank_id, &summary.id, &input.language)?;
+        }
+
+        let translation_result: Result<(Vec<String>, String, String), String> = if settings.translation_provider == "microsoft_translator" {
+            call_translator_batch_api(&settings, &segments, &input.language)
+                .map(|rows| (rows, "microsoft-translator".to_string(), "text-translation-v3".to_string()))
+        } else {
+            call_ai_translation_api(&settings, &segments, &input.language).map(|rows| (rows, "ai".to_string(), settings.model.clone()))
+        };
+        let (translated_segments, provider, model) = match translation_result {
+            Ok(value) => value,
+            Err(err) => {
+                failed += 1;
+                let message = format!("第 {current_index}/{total} 题翻译失败（Q{}）：{err}", summary.sequence_number);
+                send_batch_translate_event(
+                    &on_event,
+                    BatchTranslateEvent {
+                        bank_id: input.bank_id.clone(),
+                        translation_db_path: translation_db_path_text.clone(),
+                        current_index,
+                        total,
+                        translated,
+                        skipped,
+                        failed,
+                        current_question_id: Some(summary.id.clone()),
+                        current_sequence_number: Some(summary.sequence_number),
+                        message: message.clone(),
+                        done: false,
+                        error: Some(message.clone()),
+                    },
+                );
+                return Err(message);
+            }
+        };
+        if translated_segments.len() != segments.len() {
+            failed += 1;
+            let message = format!("第 {current_index}/{total} 题翻译结果数量不匹配：期望 {}，实际 {}。", segments.len(), translated_segments.len());
+            send_batch_translate_event(
+                &on_event,
+                BatchTranslateEvent {
+                    bank_id: input.bank_id.clone(),
+                    translation_db_path: translation_db_path_text.clone(),
+                    current_index,
+                    total,
+                    translated,
+                    skipped,
+                    failed,
+                    current_question_id: Some(summary.id.clone()),
+                    current_sequence_number: Some(summary.sequence_number),
+                    message: message.clone(),
+                    done: false,
+                    error: Some(message.clone()),
+                },
+            );
+            return Err(message);
+        }
+
+        for (segment, translated_text) in segments.iter().zip(translated_segments.iter()) {
+            save_translation_segment_in_conn(
+                &conn,
+                &input.bank_id,
+                &summary.id,
+                &segment.field_name,
+                segment.segment_index,
+                &segment.source_text,
+                &input.language,
+                translated_text,
+                &provider,
+                &model,
+            )?;
+        }
+        translated += 1;
+        send_batch_translate_event(
+            &on_event,
+            BatchTranslateEvent {
+                bank_id: input.bank_id.clone(),
+                translation_db_path: translation_db_path_text.clone(),
+                current_index,
+                total,
+                translated,
+                skipped,
+                failed,
+                current_question_id: Some(summary.id.clone()),
+                current_sequence_number: Some(summary.sequence_number),
+                message: format!("第 {current_index}/{total} 题翻译完成。"),
+                done: false,
+                error: None,
+            },
+        );
+    }
+
+    let result = BatchTranslateResult {
+        bank_id: input.bank_id.clone(),
+        translation_db_path: translation_db_path_text.clone(),
+        total,
+        translated,
+        skipped,
+        failed,
+    };
+    send_batch_translate_event(
+        &on_event,
+        BatchTranslateEvent {
+            bank_id: input.bank_id,
+            translation_db_path: translation_db_path_text,
+            current_index: total,
+            total,
+            translated,
+            skipped,
+            failed,
+            current_question_id: None,
+            current_sequence_number: None,
+            message: format!("批量翻译完成：新翻译 {translated} 题，跳过 {skipped} 题，失败 {failed} 题。"),
+            done: true,
+            error: None,
+        },
+    );
+    Ok(result)
+}
+
+fn send_batch_translate_event(on_event: &Channel<BatchTranslateEvent>, event: BatchTranslateEvent) {
+    let _ = on_event.send(event);
+}
+
+fn translation_package_has_current_segments(
+    conn: &Connection,
+    bank_id: &str,
+    question_id: &str,
+    language: &str,
+    segments: &[TranslationSegment],
+) -> Result<bool, String> {
+    if segments.is_empty() {
+        return Ok(true);
+    }
+    for segment in segments {
+        let source_hash = hash_text(&segment.source_text);
+        let count = conn
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM translation_segments
+                WHERE bank_id = ?1 AND question_id = ?2 AND field_name = ?3
+                  AND segment_index = ?4 AND language = ?5 AND source_hash = ?6
+                "#,
+                params![bank_id, question_id, segment.field_name, segment.segment_index, language, source_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|err| err.to_string())?;
+        if count == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn translate_question_blocking(input: TranslateQuestionInput) -> Result<Vec<TranslationRow>, String> {
@@ -2021,13 +2450,8 @@ fn translate_question_blocking(input: TranslateQuestionInput) -> Result<Vec<Tran
 }
 
 fn clear_translation_rows(bank_id: &str, question_id: &str, language: &str) -> Result<(), String> {
-    let conn = open_app_db()?;
-    conn.execute(
-        "DELETE FROM translation_segments WHERE bank_id = ?1 AND question_id = ?2 AND language = ?3",
-        params![bank_id, question_id, language],
-    )
-    .map(|_| ())
-    .map_err(|err| err.to_string())
+    let (conn, _) = open_translation_db(bank_id)?;
+    clear_translation_rows_in_conn(&conn, bank_id, question_id, language)
 }
 
 fn translation_segments_from_question(question: &QuestionDetail) -> Vec<TranslationSegment> {
@@ -2088,7 +2512,33 @@ fn save_translation_segment(
     provider: &str,
     model: &str,
 ) -> Result<TranslationRow, String> {
-    let conn = open_app_db()?;
+    let (conn, _) = open_translation_db(bank_id)?;
+    save_translation_segment_in_conn(
+        &conn,
+        bank_id,
+        question_id,
+        field_name,
+        segment_index,
+        source_text,
+        language,
+        translated_text,
+        provider,
+        model,
+    )
+}
+
+fn save_translation_segment_in_conn(
+    conn: &Connection,
+    bank_id: &str,
+    question_id: &str,
+    field_name: &str,
+    segment_index: i64,
+    source_text: &str,
+    language: &str,
+    translated_text: &str,
+    provider: &str,
+    model: &str,
+) -> Result<TranslationRow, String> {
     let now = Utc::now().to_rfc3339();
     let source_hash = hash_text(source_text);
     let version = conn
@@ -2119,8 +2569,21 @@ fn save_translation_segment(
     })
 }
 
+fn clear_translation_rows_in_conn(conn: &Connection, bank_id: &str, question_id: &str, language: &str) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM translation_segments WHERE bank_id = ?1 AND question_id = ?2 AND language = ?3",
+        params![bank_id, question_id, language],
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
 fn load_translation_rows(bank_id: &str, question_id: &str, language: &str) -> Result<Vec<TranslationRow>, String> {
-    let conn = open_app_db()?;
+    let (conn, _) = open_translation_db(bank_id)?;
+    load_translation_rows_from_conn(&conn, bank_id, question_id, language)
+}
+
+fn load_translation_rows_from_conn(conn: &Connection, bank_id: &str, question_id: &str, language: &str) -> Result<Vec<TranslationRow>, String> {
     let mut stmt = conn
         .prepare(
             r#"
@@ -2179,7 +2642,8 @@ fn main() {
             ask_ai_about_question,
             ask_ai_about_question_stream,
             get_cached_translations,
-            translate_question
+            translate_question,
+            batch_translate_bank
         ])
         .run(tauri::generate_context!())
         .expect("error while running TauriExam");
@@ -2205,6 +2669,7 @@ mod tests {
         let url = translator_url_with_target("https://api.cognitive.microsofttranslator.com/translate", "zh-Hans");
         println!("translator endpoint shape: {}", sanitized_translator_endpoint_shape(&settings.translator_endpoint));
         println!("translator region: {region}");
+        println!("translator key edge: {}", test_key_edge(&settings.translator_key));
         println!("translator request path: {}", super::sanitized_translator_url_path(&url));
         let result = call_translator_batch_api(
             &settings,
@@ -2225,6 +2690,48 @@ mod tests {
         println!("translator live result: {}", result[0]);
     }
 
+    #[test]
+    #[ignore = "uses saved live Microsoft Translator credentials"]
+    fn translator_live_official_text_rest_with_saved_settings() {
+        let mut settings = load_ai_settings().expect("load saved app settings");
+        if let Ok(endpoint) = std::env::var("TRANSLATOR_TEST_ENDPOINT") {
+            settings.translator_endpoint = endpoint;
+        }
+        if let Ok(region) = std::env::var("TRANSLATOR_TEST_REGION") {
+            settings.translator_region = region;
+        }
+        assert!(
+            !settings.translator_key.trim().is_empty(),
+            "translator key is empty in saved settings"
+        );
+        let region = translator_region_for_config(&settings).expect("resolve translator region");
+        let url = translator_url_with_target("https://api.cognitive.microsofttranslator.com/translate", "zh-Hans");
+        let agent = super::http_agent();
+        let body = json!([{ "Text": "Hello" }]);
+
+        println!("official text endpoint shape: {}", sanitized_translator_endpoint_shape(&settings.translator_endpoint));
+        println!("official text region: {region}");
+        println!("official text key edge: {}", test_key_edge(&settings.translator_key));
+        println!("official text url: {}", super::sanitized_translator_url_path(&url));
+
+        let direct = agent
+            .post(&url)
+            .set("Ocp-Apim-Subscription-Key", settings.translator_key.trim())
+            .set("Ocp-Apim-Subscription-Region", region.as_str())
+            .set("Content-Type", "application/json; charset=UTF-8")
+            .send_json(&body)
+            .expect("send official key+region request");
+        let direct_status = direct.status();
+        let direct_text = direct.into_string().expect("read official key+region response");
+        println!("official key+region status: {direct_status}");
+        println!("official key+region body: {direct_text}");
+
+        assert!(
+            direct_status >= 200 && direct_status < 300,
+            "official Translator Text REST key+region request failed; status={direct_status}"
+        );
+    }
+
     fn sanitized_translator_endpoint_shape(endpoint: &str) -> &'static str {
         let lower = endpoint.to_lowercase();
         if lower.contains(".cognitiveservices.azure.com") {
@@ -2234,6 +2741,13 @@ mod tests {
         } else {
             "other"
         }
+    }
+
+    fn test_key_edge(key: &str) -> String {
+        let trimmed = key.trim();
+        let prefix = trimmed.chars().take(2).collect::<String>();
+        let suffix = trimmed.chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect::<String>();
+        format!("{prefix}...{suffix} (len={})", trimmed.chars().count())
     }
 
 }
