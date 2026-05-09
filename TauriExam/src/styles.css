@@ -269,7 +269,7 @@ p {
 
 .content-grid {
   display: grid;
-  grid-template-columns: minmax(360px, 470px) minmax(0, 1fr);
+  grid-template-columns: minmax(200px, 260px) minmax(0, 1fr);
   gap: 20px;
   min-height: 0;
 }
@@ -320,8 +320,8 @@ p {
 .question-grid {
   overflow: auto;
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 6px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 5px;
   padding-right: 4px;
 }
 
@@ -330,9 +330,9 @@ p {
   align-items: center;
   justify-content: center;
   min-width: 0;
-  height: 38px;
-  border-radius: 10px;
-  font-size: 13px;
+  height: 30px;
+  border-radius: 8px;
+  font-size: 12px;
   font-weight: 600;
   background: var(--panel-strong);
   color: var(--text);
@@ -454,7 +454,8 @@ p {
   max-height: calc(100vh - 145px);
   overflow: auto;
   display: grid;
-  gap: 18px;
+  gap: 14px;
+  align-content: start;
 }
 
 .question-detail.compact {
@@ -466,8 +467,8 @@ p {
 }
 
 .detail-title h3 {
-  margin-top: 4px;
-  font-size: 24px;
+  margin-top: 2px;
+  font-size: 18px;
 }
 
 .question-detail section {
@@ -951,6 +952,66 @@ p {
   gap: 10px;
 }
 
+.translation-panel {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
+  padding-block: 4px;
+  margin-inline: -2px;
+  gap: 4px;
+}
+
+.toolbar-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  align-items: center;
+}
+
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.toolbar-spacer {
+  flex: 1;
+}
+
+.nav-icon-group {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.icon-btn:hover:not(:disabled) {
+  background: var(--primary-soft);
+  color: var(--primary-strong);
+}
+.icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.justify-end {
+  justify-content: flex-end;
+}
+
 .panel-headline,
 .interaction-meta {
   display: flex;
@@ -971,19 +1032,20 @@ p {
 
 .segmented-control {
   display: inline-flex;
-  gap: 4px;
-  padding: 4px;
+  gap: 2px;
+  padding: 3px;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 10px;
   background: var(--panel-strong);
 }
 
 .segmented-control button {
-  min-height: 32px;
-  padding: 6px 12px;
-  border-radius: 10px;
+  min-height: 26px;
+  padding: 4px 10px;
+  border-radius: 8px;
   border-color: transparent;
   background: transparent;
+  font-size: 12px;
 }
 
 .segmented-control button.active {
@@ -991,25 +1053,17 @@ p {
   background: linear-gradient(135deg, var(--primary), #8b5cf6);
 }
 
-.segmented-control button.nav-btn {
-  margin-left: 4px;
-  font-weight: 600;
-  color: var(--primary);
-}
-
-.segmented-control button.nav-btn:disabled {
-  opacity: 0.3;
-  cursor: default;
-}
-
 .translation-panel input {
-  width: 112px;
-  min-height: 36px;
+  width: 56px;
+  min-height: 28px;
+  font-size: 12px;
+  padding: 2px 6px;
 }
 
 .translation-panel button {
-  min-height: 36px;
-  padding: 8px 12px;
+  min-height: 28px;
+  padding: 4px 10px;
+  font-size: 12px;
 }
 
 .drag-shell {
