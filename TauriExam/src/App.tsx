@@ -1217,27 +1217,18 @@ function ReviewList(props: {
       <div className="list-meta">
         显示 {props.questions.length} / {props.allCount} 题
       </div>
-      <div className="question-list">
+      <div className="question-grid">
         {props.questions.length === 0 ? (
           <div className="empty-state small">当前复习范围还没有题目。</div>
         ) : (
           props.questions.map((question) => (
             <button
               key={question.id}
-              className={question.id === props.selectedId ? 'question-card active' : 'question-card'}
+              className={question.id === props.selectedId ? 'q-num active' : 'q-num'}
               onClick={() => props.onSelect(question.id)}
+              title={question.preview}
             >
-              <div className="question-card-head">
-                <strong>Q{question.sequence_number}</strong>
-                <span>{question.question_type}</span>
-              </div>
-              <p>{question.preview}</p>
-              <div className="tag-row">
-                <em>{question.status}</em>
-                <em>
-                  p.{question.page_from ?? '?'}–{question.page_to ?? '?'}
-                </em>
-              </div>
+              {question.sequence_number}
             </button>
           ))
         )}
@@ -1296,24 +1287,15 @@ function QuestionList(props: {
       <div className="list-meta">
         显示 {props.questions.length} / {props.allCount} 题
       </div>
-      <div className="question-list">
+      <div className="question-grid">
         {props.questions.map((question) => (
           <button
             key={question.id}
-            className={question.id === props.selectedId ? 'question-card active' : 'question-card'}
+            className={question.id === props.selectedId ? 'q-num active' : 'q-num'}
             onClick={() => props.onSelect(question.id)}
+            title={question.preview}
           >
-            <div className="question-card-head">
-              <strong>Q{question.sequence_number}</strong>
-              <span>{question.question_type}</span>
-            </div>
-            <p>{question.preview}</p>
-            <div className="tag-row">
-              <em>{question.status}</em>
-              <em>
-                p.{question.page_from ?? '?'}–{question.page_to ?? '?'}
-              </em>
-            </div>
+            {question.sequence_number}
           </button>
         ))}
       </div>

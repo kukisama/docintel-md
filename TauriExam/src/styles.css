@@ -317,6 +317,39 @@ p {
   padding-right: 4px;
 }
 
+.question-grid {
+  overflow: auto;
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  padding-right: 4px;
+}
+
+.q-num {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  height: 38px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  background: var(--panel-strong);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.q-num:hover {
+  background: var(--primary-soft);
+}
+
+.q-num.active {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
 .question-card {
   text-align: left;
   display: grid;
