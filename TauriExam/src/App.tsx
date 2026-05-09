@@ -83,12 +83,14 @@ function App() {
   const [history, setHistory] = useState<ExamSessionSummary[]>([]);
   const [expandedSessionId, setExpandedSessionId] = useState('');
   const [historyAnswers, setHistoryAnswers] = useState<Record<string, ExamAnswerDetail[]>>({});
+  const [historyFilter, setHistoryFilter] = useState<'all' | 'wrong'>('all');
   const [appPaths, setAppPaths] = useState<AppPaths | null>(null);
   const [bankHealth, setBankHealth] = useState<BankHealth | null>(null);
   const [settingsMessage, setSettingsMessage] = useState('');
   const [flags, setFlags] = useState<QuestionFlag[]>([]);
   const [reviewMode, setReviewMode] = useState<ReviewMode>('wrong');
   const [reviewQuestions, setReviewQuestions] = useState<QuestionSummary[]>([]);
+  const [reviewSessionId, setReviewSessionId] = useState<string>('');
   const [returnContext, setReturnContext] = useState<ReturnContext | null>(null);
   const [interaction, setInteraction] = useState<InteractionModel | null>(null);
   const [aiSettings, setAiSettings] = useState<AiSettings | null>(null);
@@ -233,11 +235,11 @@ function App() {
     }
   }
 
-  async function loadReview(nextMode = reviewMode) {
+  async function loadReview(nextMode = reviewMode, sessionId = reviewSessionId) {
     try {
       setLoading('正在读取复习题...');
       setError('');
-      const loaded = await api.listReviewQuestions(bankId, nextMode);
+      const loaded = await api.listReviewQuestions(bankId, nextMode, sessionId || undefined);
       setReviewQuestions(loaded);
       if (loaded[0]) setSelectedId(loaded[0].id);
       setView('review');
@@ -651,6 +653,8 @@ function App() {
               onTranslate={translateCurrentQuestion}
               onToggleAnswer={() => setShowAnswer((value) => !value)}
               onLoadPages={loadPages}
+              onPrev={(() => { const idx = filtered.findIndex(q => q.id === selectedId); return idx > 0 ? () => setSelectedId(filtered[idx - 1].id) : undefined; })()}
+              onNext={(() => { const idx = filtered.findIndex(q => q.id === selectedId); return idx >= 0 && idx < filtered.length - 1 ? () => setSelectedId(filtered[idx + 1].id) : undefined; })()}
             />
           </section>
         )}
@@ -765,16 +769,24 @@ function App() {
                         {(historyAnswers[item.id] || []).length === 0 ? (
                           <div className="muted">正在读取本次考试题目...</div>
                         ) : (
-                          historyAnswers[item.id].map((answer, index) => (
-                            <button className="history-answer-row" key={answer.id} onClick={() => openHistoryQuestion(answer)}>
-                              <span>第 {index + 1} 题 / 原题 Q{answer.sequence_number}</span>
-                              <span>{answer.user_answer || '未作答'}</span>
-                              <span>{formatDuration(answer.duration_seconds)}</span>
-                              <strong className={answer.is_correct ? 'ok' : answer.is_correct === false ? 'bad' : ''}>
-                                {answer.is_correct ? '正确' : answer.is_correct === false ? '错误' : '复核'}
-                              </strong>
-                            </button>
-                          ))
+                          <>
+                            <div className="history-filter-bar">
+                              <button className={historyFilter === 'all' ? 'active' : ''} onClick={() => setHistoryFilter('all')}>全部显示</button>
+                              <button className={historyFilter === 'wrong' ? 'active' : ''} onClick={() => setHistoryFilter('wrong')}>只看错题</button>
+                            </div>
+                            {historyAnswers[item.id]
+                              .filter((a) => historyFilter === 'all' || a.is_correct === false)
+                              .map((answer, index) => (
+                              <button className="history-answer-row" key={answer.id} onClick={() => openHistoryQuestion(answer)}>
+                                <span>第 {index + 1} 题 / 原题 Q{answer.sequence_number}</span>
+                                <span>{answer.user_answer || '未作答'}</span>
+                                <span>{formatDuration(answer.duration_seconds)}</span>
+                                <strong className={answer.is_correct ? 'ok' : answer.is_correct === false ? 'bad' : ''}>
+                                  {answer.is_correct ? '正确' : answer.is_correct === false ? '错误' : '复核'}
+                                </strong>
+                              </button>
+                            ))}
+                          </>
                         )}
                       </div>
                     )}
@@ -793,10 +805,17 @@ function App() {
               allCount={reviewQuestions.length}
               selectedId={selectedId}
               query={query}
+              sessions={history.filter(h => h.bank_id === bankId && h.wrong_count > 0)}
+              sessionId={reviewSessionId}
               onQuery={setQuery}
               onMode={(mode) => {
                 setReviewMode(mode);
-                loadReview(mode);
+                setReviewSessionId('');
+                loadReview(mode, '');
+              }}
+              onSessionChange={(sid) => {
+                setReviewSessionId(sid);
+                loadReview(reviewMode, sid);
               }}
               onSelect={setSelectedId}
             />
@@ -824,6 +843,8 @@ function App() {
               onTranslate={translateCurrentQuestion}
               onToggleAnswer={() => setShowAnswer((value) => !value)}
               onLoadPages={loadPages}
+              onPrev={(() => { const idx = reviewFiltered.findIndex(q => q.id === selectedId); return idx > 0 ? () => setSelectedId(reviewFiltered[idx - 1].id) : undefined; })()}
+              onNext={(() => { const idx = reviewFiltered.findIndex(q => q.id === selectedId); return idx >= 0 && idx < reviewFiltered.length - 1 ? () => setSelectedId(reviewFiltered[idx + 1].id) : undefined; })()}
             />
           </section>
         )}
@@ -1154,8 +1175,11 @@ function ReviewList(props: {
   allCount: number;
   selectedId: string;
   query: string;
+  sessions: ExamSessionSummary[];
+  sessionId: string;
   onQuery: (value: string) => void;
   onMode: (mode: ReviewMode) => void;
+  onSessionChange: (sessionId: string) => void;
   onSelect: (id: string) => void;
 }) {
   return (
@@ -1174,6 +1198,18 @@ function ReviewList(props: {
           已掌握
         </button>
       </div>
+      {props.mode === 'wrong' && props.sessions.length > 0 && (
+        <div className="review-session-filter">
+          <select value={props.sessionId} onChange={(e) => props.onSessionChange(e.target.value)}>
+            <option value="">全局错题</option>
+            {props.sessions.map((s) => (
+              <option key={s.id} value={s.id}>
+                {new Date(s.finished_at).toLocaleDateString()} {new Date(s.finished_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})} · {s.wrong_count} 错 / {s.total_questions} 题
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       <div className="search-box">
         <Search size={16} />
         <input value={props.query} onChange={(event) => props.onQuery(event.target.value)} placeholder="搜索复习题" />
@@ -1316,6 +1352,8 @@ function QuestionPanel(props: {
   onTranslate?: (force: boolean) => void;
   onToggleAnswer: () => void;
   onLoadPages: () => void;
+  onPrev?: () => void;
+  onNext?: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const { detail } = props;
@@ -1371,6 +1409,8 @@ function QuestionPanel(props: {
           onMode={props.onTranslationMode}
           onLanguage={props.onTranslationLanguage}
           onTranslate={props.onTranslate}
+          onPrev={props.onPrev}
+          onNext={props.onNext}
         />
       )}
 
@@ -1539,6 +1579,8 @@ function TranslationPanel(props: {
   onMode: (value: TranslationMode) => void;
   onLanguage?: (value: string) => void;
   onTranslate: (force: boolean) => void;
+  onPrev?: () => void;
+  onNext?: () => void;
 }) {
   return (
     <section className="translation-panel">
@@ -1547,6 +1589,12 @@ function TranslationPanel(props: {
           <button className={props.mode === 'original' ? 'active' : ''} onClick={() => props.onMode('original')}>原文</button>
           <button className={props.mode === 'translated' ? 'active' : ''} onClick={() => props.onMode('translated')}>翻译</button>
           <button className={props.mode === 'side_by_side' ? 'active' : ''} onClick={() => props.onMode('side_by_side')}>对照</button>
+          {(props.onPrev || props.onNext) && (
+            <>
+              <button className="nav-btn" disabled={!props.onPrev} onClick={props.onPrev}>← 上一题</button>
+              <button className="nav-btn" disabled={!props.onNext} onClick={props.onNext}>下一题 →</button>
+            </>
+          )}
         </div>
         <div className="action-row compact-actions">
           <input value={props.language} onChange={(event) => props.onLanguage?.(event.target.value)} />

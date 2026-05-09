@@ -1777,8 +1777,8 @@ fn set_question_flag(input: SetQuestionFlagInput) -> Result<Vec<QuestionFlagRow>
 }
 
 #[tauri::command]
-fn list_review_questions(bank_id: String, review_mode: String) -> Result<Vec<QuestionSummary>, String> {
-    let ids = review_question_ids(&bank_id, &review_mode)?;
+fn list_review_questions(bank_id: String, review_mode: String, session_id: Option<String>) -> Result<Vec<QuestionSummary>, String> {
+    let ids = review_question_ids(&bank_id, &review_mode, session_id.as_deref())?;
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1815,9 +1815,26 @@ fn list_review_questions(bank_id: String, review_mode: String) -> Result<Vec<Que
     Ok(questions)
 }
 
-fn review_question_ids(bank_id: &str, review_mode: &str) -> Result<Vec<String>, String> {
+fn review_question_ids(bank_id: &str, review_mode: &str, session_id: Option<&str>) -> Result<Vec<String>, String> {
     let conn = open_app_db()?;
     if review_mode == "wrong" {
+        if let Some(sid) = session_id {
+            // Filter wrong questions by specific exam session
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT DISTINCT question_id
+                    FROM exam_answers
+                    WHERE bank_id = ?1 AND session_id = ?2 AND is_correct = 0
+                    "#,
+                )
+                .map_err(|err| err.to_string())?;
+            return stmt
+                .query_map(params![bank_id, sid], |row| row.get(0))
+                .map_err(|err| err.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| err.to_string());
+        }
         let mut stmt = conn
             .prepare(
                 r#"

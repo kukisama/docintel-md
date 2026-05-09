@@ -35,8 +35,8 @@ export const api = {
   checkBankHealth: (bankId: string) => invoke<BankHealth>('check_bank_health', { bankId }),
   listQuestionFlags: (bankId: string) => invoke<QuestionFlag[]>('list_question_flags', { bankId }),
   setQuestionFlag: (input: SetQuestionFlagInput) => invoke<QuestionFlag[]>('set_question_flag', { input }),
-  listReviewQuestions: (bankId: string, reviewMode: ReviewMode) =>
-    invoke<QuestionSummary[]>('list_review_questions', { bankId, reviewMode }),
+  listReviewQuestions: (bankId: string, reviewMode: ReviewMode, sessionId?: string) =>
+    invoke<QuestionSummary[]>('list_review_questions', { bankId, reviewMode, sessionId: sessionId ?? null }),
   getInteractionModel: (bankId: string, questionId: string) =>
     invoke<InteractionModel>('get_interaction_model', { bankId, questionId }),
   getAiSettings: () => invoke<AiSettings>('get_ai_settings'),
