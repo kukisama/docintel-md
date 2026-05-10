@@ -17,6 +17,8 @@ import type {
   BatchTranslateEvent,
   BankHealth,
   BankInfo,
+  DragDropUserAnswer,
+  HotspotUserAnswer,
   ExamAnswerDetail,
   ExamAnswerInput,
   ExamSessionSummary,
@@ -34,6 +36,8 @@ import { viewTitle, isFlagged, flagTypesForQuestion, uniqueSorted, shuffle, expe
 import QuestionPanel from './QuestionPanel';
 import QuestionList, { ReviewList, Stat } from './QuestionList';
 import SettingsPanel from './SettingsPanel';
+import { createCorrectDragAnswer, describeDragAnswer, gradeDragDrop, isDragDropComplete, normalizeDragAnswer } from './DragDropQuestion';
+import { createCorrectHotspotAnswer, describeHotspotAnswer, gradeHotspot, isHotspotComplete, normalizeHotspotAnswer } from './HotspotQuestion';
 
 type View = 'browse' | 'exam' | 'history' | 'review' | 'settings';
 type Theme = 'light' | 'dark';
@@ -50,6 +54,8 @@ type ExamDraft = {
   index: number;
   answers: ExamAnswerInput[];
   selected: string[];
+  dragAnswer: DragDropUserAnswer | null;
+  hotspotAnswer: HotspotUserAnswer | null;
   questionStartedAt: number;
   finished: boolean;
 };
@@ -73,7 +79,7 @@ function App() {
   const [error, setError] = useState('');
   const [examCount, setExamCount] = useState(20);
   const [examMode, setExamMode] = useState<'order' | 'random'>('order');
-  const [examCategories, setExamCategories] = useState<ExamCategory[]>(['single_choice', 'multiple_choice', 'hotspot']);
+  const [examCategories, setExamCategories] = useState<ExamCategory[]>(['single_choice', 'multiple_choice', 'hotspot', 'drag_drop']);
   const [exam, setExam] = useState<ExamDraft | null>(null);
   const [history, setHistory] = useState<ExamSessionSummary[]>([]);
   const [expandedSessionId, setExpandedSessionId] = useState('');
@@ -167,6 +173,18 @@ function App() {
   }, [reviewQuestions, query, topicFilter]);
 
   const reviewTopics = useMemo(() => uniqueSorted(reviewQuestions.map((question) => question.topic || 'Uncategorized')), [reviewQuestions]);
+  const currentHistoryUserAnswer = useMemo(() => {
+    if (!returnContext || !selectedId) return null;
+    return historyAnswers[returnContext.sessionId]?.find((answer) => answer.question_id === selectedId)?.user_answer ?? null;
+  }, [historyAnswers, returnContext, selectedId]);
+  const isStructuredDrag = interaction?.kind === 'drag_drop' && interaction.can_auto_grade && interaction.slots.length > 0;
+  const isStructuredHotspot = interaction?.kind === 'hotspot' && interaction.can_auto_grade && interaction.rows.length > 0 && interaction.options.length > 0;
+  const currentDragAnswer = isStructuredDrag && interaction ? normalizeDragAnswer(interaction, exam?.dragAnswer) : null;
+  const currentHotspotAnswer = isStructuredHotspot && interaction ? normalizeHotspotAnswer(interaction, exam?.hotspotAnswer) : null;
+  const currentDragComplete = Boolean(isStructuredDrag && interaction && isDragDropComplete(interaction, currentDragAnswer));
+  const currentHotspotComplete = Boolean(isStructuredHotspot && interaction && isHotspotComplete(interaction, currentHotspotAnswer));
+  const isCurrentDragLike = Boolean(detail?.question_type.toLowerCase().includes('drag') || detail?.question_type.toLowerCase().includes('drop'));
+  const isCurrentHotspotLike = Boolean(detail?.question_type.toLowerCase().includes('hotspot'));
 
   async function bootstrap() {
     try {
@@ -203,6 +221,7 @@ function App() {
     try {
       setLoading('正在读取题目...');
       setError('');
+      setInteraction(null);
       const loaded = await api.getQuestion(bankId, questionId);
       setDetail(loaded);
       setInteraction(await api.getInteractionModel(bankId, questionId));
@@ -478,6 +497,8 @@ function App() {
       index: 0,
       answers: [],
       selected: [],
+      dragAnswer: null,
+      hotspotAnswer: null,
       questionStartedAt: Date.now(),
       finished: false,
     });
@@ -487,17 +508,46 @@ function App() {
 
   async function submitExamAnswer(manualCorrect?: boolean | null) {
     if (!exam || !detail) return;
-    const selected = exam.selected.join(',');
+    setError('');
     const recommended = detail.recommended_answer || '';
     const expected = expectedLetters(recommended);
-    const isAuto = detail.options.length > 0 && expected.length > 0;
-    const isCorrect = isAuto ? sameSet(exam.selected, expected) : manualCorrect ?? null;
+    let userAnswer = exam.selected.join(',');
+    let correctAnswer = detail.source_answer || '';
+    let recommendedAnswer = recommended;
+    let isCorrect: boolean | null = manualCorrect ?? null;
+
+    if (isStructuredDrag && interaction) {
+      const dragAnswer = normalizeDragAnswer(interaction, exam.dragAnswer);
+      if (!isDragDropComplete(interaction, dragAnswer)) {
+        setError('这道 Drag Drop 题还有槽位未填，请填完后再提交。');
+        return;
+      }
+      userAnswer = JSON.stringify(dragAnswer);
+      correctAnswer = JSON.stringify(createCorrectDragAnswer(interaction));
+      recommendedAnswer = describeDragAnswer(interaction, createCorrectDragAnswer(interaction));
+      isCorrect = gradeDragDrop(interaction, dragAnswer);
+    } else if (isStructuredHotspot && interaction) {
+      const hotspotAnswer = normalizeHotspotAnswer(interaction, exam.hotspotAnswer);
+      if (!isHotspotComplete(interaction, hotspotAnswer)) {
+        setError('这道 Hotspot 题还有下拉框未选择，请填完后再提交。');
+        return;
+      }
+      userAnswer = JSON.stringify(hotspotAnswer);
+      correctAnswer = JSON.stringify(createCorrectHotspotAnswer(interaction));
+      recommendedAnswer = describeHotspotAnswer(interaction, createCorrectHotspotAnswer(interaction));
+      isCorrect = gradeHotspot(interaction, hotspotAnswer);
+    } else {
+      const isAuto = detail.options.length > 0 && expected.length > 0;
+      isCorrect = isAuto ? sameSet(exam.selected, expected) : manualCorrect ?? null;
+      userAnswer = userAnswer || (manualCorrect === true ? 'manual:correct' : manualCorrect === false ? 'manual:wrong' : '');
+    }
+
     const answer: ExamAnswerInput = {
       question_id: detail.id,
       sequence_number: detail.sequence_number,
-      user_answer: selected || (manualCorrect === true ? 'manual:correct' : manualCorrect === false ? 'manual:wrong' : ''),
-      correct_answer: detail.source_answer || '',
-      recommended_answer: recommended,
+      user_answer: userAnswer,
+      correct_answer: correctAnswer,
+      recommended_answer: recommendedAnswer,
       is_correct: isCorrect,
       duration_seconds: Math.max(1, Math.round((Date.now() - exam.questionStartedAt) / 1000)),
     };
@@ -524,9 +574,19 @@ function App() {
       index: nextIndex,
       answers: nextAnswers,
       selected: [],
+      dragAnswer: null,
+      hotspotAnswer: null,
       questionStartedAt: Date.now(),
     });
     setSelectedId(nextQuestion.id);
+  }
+
+  function updateDragAnswer(value: DragDropUserAnswer) {
+    setExam((current) => (current ? { ...current, dragAnswer: value } : current));
+  }
+
+  function updateHotspotAnswer(value: HotspotUserAnswer) {
+    setExam((current) => (current ? { ...current, hotspotAnswer: value } : current));
   }
 
   function toggleChoice(key: string) {
@@ -674,6 +734,7 @@ function App() {
               translationBusy={translationBusy}
               pagesBusy={pagesBusy}
               returnLabel={returnContext?.label}
+              historyUserAnswer={currentHistoryUserAnswer}
               onReturn={returnContext ? returnToHistory : undefined}
               onToggleFlag={toggleQuestionFlag}
               onAiPrompt={setAiPrompt}
@@ -717,6 +778,9 @@ function App() {
                 <button className={examCategories.includes('hotspot') ? 'selected' : ''} onClick={() => toggleExamCategory('hotspot')}>
                   Hotspot
                 </button>
+                <button className={examCategories.includes('drag_drop') ? 'selected' : ''} onClick={() => toggleExamCategory('drag_drop')}>
+                  Drag
+                </button>
               </div>
               <button className="primary" onClick={startExam}>
                 开始考试
@@ -746,10 +810,41 @@ function App() {
                     hideActions
                     hideAnswerAreas
                     pagesBusy={pagesBusy}
+                    interaction={interaction}
                     selectedOptions={exam.selected}
+                    dragAnswer={currentDragAnswer}
+                    hotspotAnswer={currentHotspotAnswer}
                     onOptionSelect={toggleChoice}
+                    onDragAnswerChange={updateDragAnswer}
+                    onHotspotAnswerChange={updateHotspotAnswer}
                   />
-                  {detail.options.length > 0 ? (
+                  {isCurrentDragLike && !interaction ? (
+                    <div className="choice-bar">
+                      <button className="primary" disabled>
+                        正在加载 Drag Drop 交互模型...
+                      </button>
+                    </div>
+                  ) : isCurrentHotspotLike && !interaction ? (
+                    <div className="choice-bar">
+                      <button className="primary" disabled>
+                        正在加载 Hotspot 交互模型...
+                      </button>
+                    </div>
+                  ) : isStructuredDrag ? (
+                    <div className="choice-bar">
+                      <button className="primary" disabled={!currentDragComplete} onClick={() => submitExamAnswer()}>
+                        提交 Drag Drop
+                      </button>
+                      {!currentDragComplete && <span className="muted">请先填完所有槽位。</span>}
+                    </div>
+                  ) : isStructuredHotspot ? (
+                    <div className="choice-bar">
+                      <button className="primary" disabled={!currentHotspotComplete} onClick={() => submitExamAnswer()}>
+                        提交 Hotspot
+                      </button>
+                      {!currentHotspotComplete && <span className="muted">请先完成所有下拉选择。</span>}
+                    </div>
+                  ) : detail.options.length > 0 ? (
                     <div className="choice-bar">
                       <button className="primary" disabled={exam.selected.length === 0} onClick={() => submitExamAnswer()}>
                         提交本题

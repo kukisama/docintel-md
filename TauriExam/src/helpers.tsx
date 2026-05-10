@@ -2,7 +2,7 @@ import type { QuestionFlag, TranslationRow } from './types';
 
 export type View = 'browse' | 'exam' | 'history' | 'review' | 'settings';
 export type Theme = 'light' | 'dark';
-export type ExamCategory = 'single_choice' | 'multiple_choice' | 'hotspot';
+export type ExamCategory = 'single_choice' | 'multiple_choice' | 'hotspot' | 'drag_drop';
 export type TranslationMode = 'original' | 'translated' | 'side_by_side';
 
 export type ReturnContext = {
@@ -66,6 +66,7 @@ export function sameSet(left: string[], right: string[]) {
 export function matchesExamCategory(questionType: string, category: ExamCategory) {
   const normalized = questionType.toLowerCase();
   if (category === 'hotspot') return normalized.includes('hotspot');
+  if (category === 'drag_drop') return normalized.includes('drag') || normalized.includes('drop');
   if (category === 'single_choice') return normalized.includes('single_choice');
   return normalized.includes('multiple_choice');
 }

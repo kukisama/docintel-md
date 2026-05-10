@@ -656,7 +656,7 @@ p {
 
 .category-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 8px;
 }
 
@@ -1114,6 +1114,246 @@ p {
   color: var(--primary-strong);
 }
 
+.drag-drop-board {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 14px;
+  background: var(--panel-strong);
+}
+
+.drag-drop-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.drag-drop-head p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.drag-drop-head > span {
+  white-space: nowrap;
+  color: var(--primary-strong);
+  background: var(--primary-soft);
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.drag-drop-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.9fr) minmax(280px, 1.2fr);
+  gap: 14px;
+}
+
+.drag-option-pool,
+.drag-slot-list {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.drag-option-card {
+  width: 100%;
+  justify-content: flex-start;
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+  gap: 10px;
+  text-align: left;
+  border-radius: 16px;
+  padding: 10px 12px;
+  background: var(--panel);
+  cursor: grab;
+  user-select: none;
+}
+
+.drag-option-card:active {
+  cursor: grabbing;
+}
+
+.drag-option-card strong {
+  color: #fff;
+  border-radius: 12px;
+  padding: 4px 8px;
+  background: linear-gradient(135deg, var(--primary), #8b5cf6);
+}
+
+.drag-option-card span {
+  line-height: 1.45;
+}
+
+.drag-option-card em {
+  font-style: normal;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.drag-option-card.selected {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+  background: var(--primary-soft);
+}
+
+.drag-option-card.used:not(.selected) {
+  opacity: 0.72;
+}
+
+.drag-option-card:disabled,
+.drag-option-card[aria-disabled='true'] {
+  cursor: default;
+  opacity: 1;
+}
+
+.drag-slot-card {
+  display: grid;
+  gap: 10px;
+  border: 1px dashed var(--line);
+  border-radius: 18px;
+  padding: 12px;
+  background: var(--panel);
+}
+
+.drag-slot-card.filled {
+  border-style: solid;
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.drag-slot-card.correct {
+  border-color: var(--ok);
+  background: rgba(5, 150, 105, 0.12);
+}
+
+.drag-slot-card.wrong {
+  border-color: var(--bad);
+  background: rgba(220, 38, 38, 0.10);
+}
+
+.drag-slot-label {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.drag-slot-label > span {
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.drag-slot-actions {
+  display: inline-flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.drag-slot-actions button {
+  min-height: 28px;
+  padding: 4px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+}
+
+.drag-slot-value {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 10px;
+  background: var(--panel-strong);
+}
+
+.drag-slot-value strong {
+  line-height: 1.45;
+}
+
+.drag-slot-value small {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.drag-practice-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.drag-practice-actions .result {
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.drag-practice-actions .result.correct {
+  color: var(--ok);
+  background: rgba(5, 150, 105, 0.12);
+}
+
+.drag-practice-actions .result.wrong {
+  color: var(--bad);
+  background: rgba(220, 38, 38, 0.10);
+}
+
+.hotspot-board {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 14px;
+  background: var(--panel-strong);
+}
+
+.hotspot-row-list {
+  display: grid;
+  gap: 10px;
+}
+
+.hotspot-row-card {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(260px, 0.9fr);
+  gap: 10px;
+  align-items: center;
+  border: 1px dashed var(--line);
+  border-radius: 16px;
+  padding: 12px;
+  background: var(--panel);
+}
+
+.hotspot-row-card label {
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.hotspot-row-card select {
+  width: 100%;
+  min-height: 40px;
+}
+
+.hotspot-row-card small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
+.hotspot-row-card.correct {
+  border-style: solid;
+  border-color: var(--ok);
+  background: rgba(5, 150, 105, 0.12);
+}
+
+.hotspot-row-card.wrong {
+  border-style: solid;
+  border-color: var(--bad);
+  background: rgba(220, 38, 38, 0.10);
+}
+
 .translation-list {
   display: grid;
   gap: 10px;
@@ -1423,8 +1663,14 @@ p {
   }
 
   .settings-form-grid,
-  .drag-shell {
+  .drag-shell,
+  .drag-drop-grid,
+  .hotspot-row-card {
     grid-template-columns: 1fr;
+  }
+
+  .category-grid {
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .question-list-panel,

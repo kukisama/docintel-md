@@ -43,6 +43,21 @@ D. <option D>
 |---|---|
 | <prompt 1> | <answer 1> |
 | <prompt 2> | <answer 2> |
+
+### Interaction Options
+
+| Option ID | Text | Group | Distractor | Sort |
+|---|---|---|---|---:|
+| opt-a | <candidate option text> | <optional group> | No | 1 |
+| opt-b | <candidate option text> | <optional group> | No | 2 |
+| opt-c | <distractor option text> | <optional group> | Yes | 3 |
+
+### Interaction Targets
+
+| Target ID | Position | Label | Option Group | Correct Option ID |
+|---|---:|---|---|---|
+| target-1 | 1 | <first blank / first row / first slot> | <optional group> | opt-a |
+| target-2 | 2 | <second blank / second row / second slot> | <optional group> | opt-b |
 -->
 
 <!-- Yes/No Series 使用下面结构：

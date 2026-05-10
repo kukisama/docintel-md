@@ -2000,6 +2000,7 @@ fn get_interaction_model(bank_id: String, question_id: String) -> Result<Interac
     let conn = open_bank(&bank_id)?;
     let question = get_question(bank_id, question_id)?;
     let normalized = question.question_type.to_lowercase();
+    let interaction_kind = question_interaction_kind(&question.question_md);
 
     if !question.options.is_empty() {
         return Ok(InteractionModel {
@@ -2023,29 +2024,86 @@ fn get_interaction_model(bank_id: String, question_id: String) -> Result<Interac
         });
     }
 
+    if table_exists(&conn, "interaction_targets") && table_exists(&conn, "interaction_options") {
+        let options = query_interaction_options(&conn, "interaction_options", &question.id)?;
+        let targets = query_unified_interaction_targets(&conn, &question.id)?;
+        if !targets.is_empty() && !options.is_empty() {
+            if normalized.contains("hotspot") || interaction_kind.as_deref() == Some("dropdown_hotspot") {
+                return Ok(InteractionModel {
+                    kind: "hotspot".to_string(),
+                    can_auto_grade: true,
+                    message: "检测到统一 interaction_options / interaction_targets，已按 Hotspot 下拉题渲染。".to_string(),
+                    options,
+                    rows: targets
+                        .into_iter()
+                        .map(|target| InteractionRow {
+                            id: target.id,
+                            prompt: target.label,
+                            option_group: target.option_group,
+                            correct_selection: target.correct_option,
+                            sort_order: target.sort_order,
+                        })
+                        .collect(),
+                    slots: Vec::new(),
+                    answer_key: Vec::new(),
+                });
+            }
+            if normalized.contains("drag") || normalized.contains("drop") || matches!(interaction_kind.as_deref(), Some("drag_drop" | "ordered_list")) {
+                let is_ordered = interaction_kind.as_deref() == Some("ordered_list");
+                let slots: Vec<InteractionSlot> = targets
+                    .into_iter()
+                    .map(|target| InteractionSlot {
+                        id: target.id,
+                        label: if is_ordered { format!("{}. {}", target.sort_order, target.label) } else { target.label },
+                        correct_option: target.correct_option,
+                        sort_order: target.sort_order,
+                    })
+                    .collect();
+                return Ok(InteractionModel {
+                    kind: "drag_drop".to_string(),
+                    can_auto_grade: true,
+                    message: if is_ordered {
+                        "检测到统一 interaction_options / interaction_targets，已按有序拖拽题渲染。".to_string()
+                    } else {
+                        "检测到统一 interaction_options / interaction_targets，已按 Drag Drop 题渲染。".to_string()
+                    },
+                    options,
+                    answer_key: slots.iter().filter_map(|slot| slot.correct_option.clone()).collect(),
+                    rows: Vec::new(),
+                    slots,
+                });
+            }
+        }
+    }
+
     if normalized.contains("hotspot") && table_exists(&conn, "hotspot_rows") {
-        return Ok(InteractionModel {
-            kind: "hotspot".to_string(),
-            can_auto_grade: true,
-            message: "检测到 hotspot_rows，已启用结构化 Hotspot 框架。".to_string(),
-            options: query_interaction_options(&conn, "hotspot_options", &question.id)?,
-            rows: query_hotspot_rows(&conn, &question.id)?,
-            slots: Vec::new(),
-            answer_key: Vec::new(),
-        });
+        let rows = query_hotspot_rows(&conn, &question.id)?;
+        if !rows.is_empty() {
+            return Ok(InteractionModel {
+                kind: "hotspot".to_string(),
+                can_auto_grade: true,
+                message: "检测到当前题的 hotspot_rows，已启用结构化 Hotspot 框架。".to_string(),
+                options: query_interaction_options(&conn, "hotspot_options", &question.id)?,
+                rows,
+                slots: Vec::new(),
+                answer_key: Vec::new(),
+            });
+        }
     }
 
     if normalized.contains("drag") && table_exists(&conn, "drag_slots") {
         let slots = query_drag_slots(&conn, &question.id)?;
-        return Ok(InteractionModel {
-            kind: "drag_drop".to_string(),
-            can_auto_grade: true,
-            message: "检测到 drag_slots，已启用结构化 Drag Drop 框架。".to_string(),
-            options: query_interaction_options(&conn, "drag_options", &question.id)?,
-            answer_key: slots.iter().filter_map(|slot| slot.correct_option.clone()).collect(),
-            rows: Vec::new(),
-            slots,
-        });
+        if !slots.is_empty() {
+            return Ok(InteractionModel {
+                kind: "drag_drop".to_string(),
+                can_auto_grade: true,
+                message: "检测到当前题的 drag_slots，已启用结构化 Drag Drop 自动判分。".to_string(),
+                options: query_interaction_options(&conn, "drag_options", &question.id)?,
+                answer_key: slots.iter().filter_map(|slot| slot.correct_option.clone()).collect(),
+                rows: Vec::new(),
+                slots,
+            });
+        }
     }
 
     Ok(InteractionModel {
@@ -2073,8 +2131,8 @@ fn query_interaction_options(conn: &Connection, table: &str, question_id: &str) 
     if !table_exists(conn, table) {
         return Ok(Vec::new());
     }
-    let sql = if table == "drag_options" {
-        format!("SELECT id, option_text, NULL, coalesce(is_distractor, 0), sort_order FROM {table} WHERE question_id = ?1 ORDER BY sort_order")
+    let sql = if table == "interaction_options" || table == "drag_options" {
+        format!("SELECT id, option_text, option_group, coalesce(is_distractor, 0), sort_order FROM {table} WHERE question_id = ?1 ORDER BY sort_order")
     } else {
         format!("SELECT id, option_text, option_group, 0, sort_order FROM {table} WHERE question_id = ?1 ORDER BY sort_order")
     };
@@ -2093,6 +2151,42 @@ fn query_interaction_options(conn: &Connection, table: &str, question_id: &str) 
     .collect::<Result<Vec<_>, _>>()
     .map_err(|err| err.to_string())?;
     Ok(options)
+}
+
+#[derive(Debug)]
+struct UnifiedInteractionTarget {
+    id: String,
+    sort_order: i64,
+    label: String,
+    option_group: Option<String>,
+    correct_option: Option<String>,
+}
+
+fn query_unified_interaction_targets(conn: &Connection, question_id: &str) -> Result<Vec<UnifiedInteractionTarget>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, position, target_label, option_group, correct_option FROM interaction_targets WHERE question_id = ?1 ORDER BY position")
+        .map_err(|err| err.to_string())?;
+    let targets = stmt.query_map(params![question_id], |row| {
+        Ok(UnifiedInteractionTarget {
+            id: row.get(0)?,
+            sort_order: row.get(1)?,
+            label: row.get(2)?,
+            option_group: row.get(3)?,
+            correct_option: row.get(4)?,
+        })
+    })
+    .map_err(|err| err.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| err.to_string())?;
+    Ok(targets)
+}
+
+fn question_interaction_kind(question_md: &str) -> Option<String> {
+    question_md.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let value = trimmed.strip_prefix("- Interaction:")?.trim();
+        Some(value.to_lowercase().replace(' ', "_").replace('-', "_"))
+    })
 }
 
 fn query_hotspot_rows(conn: &Connection, question_id: &str) -> Result<Vec<InteractionRow>, String> {
@@ -2351,7 +2445,7 @@ fn batch_translate_bank_blocking(input: BatchTranslateInput, on_event: Channel<B
     for (index, summary) in questions.iter().enumerate() {
         let current_index = index as i64 + 1;
         let question = get_question(input.bank_id.clone(), summary.id.clone())?;
-        let segments = translation_segments_from_question(&question);
+        let segments = translation_segments_for_question(&input.bank_id, &question)?;
 
         if !input.force && translation_package_has_current_segments(&conn, &input.bank_id, &summary.id, &input.language, &segments)? {
             skipped += 1;
@@ -2549,15 +2643,15 @@ fn translation_package_has_current_segments(
 }
 
 fn translate_question_blocking(input: TranslateQuestionInput) -> Result<Vec<TranslationRow>, String> {
+    let question = get_question(input.bank_id.clone(), input.question_id.clone())?;
+    let segments = translation_segments_for_question(&input.bank_id, &question)?;
     if !input.force {
-        let cached = load_translation_rows(&input.bank_id, &input.question_id, &input.language)?;
-        if !cached.is_empty() {
-            return Ok(cached);
+        let (conn, _) = open_translation_db(&input.bank_id)?;
+        if translation_package_has_current_segments(&conn, &input.bank_id, &input.question_id, &input.language, &segments)? {
+            return load_translation_rows_from_conn(&conn, &input.bank_id, &input.question_id, &input.language);
         }
     }
     let settings = load_ai_settings()?;
-    let question = get_question(input.bank_id.clone(), input.question_id.clone())?;
-    let segments = translation_segments_from_question(&question);
     let (translated_segments, provider, model) = if settings.translation_provider == "microsoft_translator" {
         (
             call_translator_batch_api(&settings, &segments, &input.language)?,
@@ -2629,6 +2723,23 @@ fn translation_segments_from_question(question: &QuestionDetail) -> Vec<Translat
         push_translation_segment(&mut segments, "notes", 0, notes);
     }
     segments
+}
+
+fn translation_segments_for_question(bank_id: &str, question: &QuestionDetail) -> Result<Vec<TranslationSegment>, String> {
+    let mut segments = translation_segments_from_question(question);
+    let model = get_interaction_model(bank_id.to_string(), question.id.clone())?;
+    if model.kind == "drag_drop" || model.kind == "hotspot" {
+        for option in &model.options {
+            push_translation_segment(&mut segments, &format!("interaction_option:{}", option.key), 0, &option.text);
+        }
+        for slot in &model.slots {
+            push_translation_segment(&mut segments, &format!("interaction_target:{}", slot.id), 0, &slot.label);
+        }
+        for row in &model.rows {
+            push_translation_segment(&mut segments, &format!("interaction_target:{}", row.id), 0, &row.prompt);
+        }
+    }
+    Ok(segments)
 }
 
 fn push_translation_segment(segments: &mut Vec<TranslationSegment>, field_name: &str, segment_index: i64, source_text: &str) {

@@ -1,10 +1,12 @@
-import { useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ArrowDown, ArrowUp, ChevronsLeft, ChevronsRight, Star } from 'lucide-react';
-import type { InteractionModel, PageImage, QuestionDetail, TranslationRow } from './types';
+import type { DragDropUserAnswer, HotspotUserAnswer, InteractionModel, PageImage, QuestionDetail, TranslationRow } from './types';
 import type { TranslationMode } from './helpers';
 import { expectedLetters, optionClassName, shouldShowInteraction, createTranslationMap, translatedNode } from './helpers';
+import DragDropQuestion, { createEmptyDragAnswer, gradeDragDrop, isDragDropComplete, parseDragAnswer } from './DragDropQuestion';
+import HotspotQuestion, { createEmptyHotspotAnswer, gradeHotspot, isHotspotComplete, parseHotspotAnswer } from './HotspotQuestion';
 
 function TranslationPanel(props: {
   rows: TranslationRow[];
@@ -97,7 +99,61 @@ function AiPanel(props: { enabled: boolean; prompt: string; answer: string; busy
   );
 }
 
-function InteractionPanel({ model }: { model: InteractionModel }) {
+function DragDropPracticePanel({ model, questionId, showAnswer, translationMode, translationMap }: { model: InteractionModel; questionId: string; showAnswer: boolean; translationMode: TranslationMode; translationMap: Map<string, string> }) {
+  const [answer, setAnswer] = useState<DragDropUserAnswer>(() => createEmptyDragAnswer(model));
+  const [checked, setChecked] = useState(false);
+  const complete = isDragDropComplete(model, answer);
+  const correct = checked ? gradeDragDrop(model, answer) : null;
+
+  useEffect(() => {
+    setAnswer(createEmptyDragAnswer(model));
+    setChecked(false);
+  }, [model, questionId]);
+
+  return (
+    <section className="interaction-panel">
+      <h4>拖拽练习</h4>
+      <div className="info-box">{model.message || '检测到结构化交互数据：请先自己拖拽作答，再检查答案。'}</div>
+      <DragDropQuestion model={model} value={answer} onChange={(value) => { setAnswer(value); setChecked(false); }} showAnswer={showAnswer || checked} translationMode={translationMode} translationMap={translationMap} />
+      <div className="drag-practice-actions">
+        <button className="primary" disabled={!complete} onClick={() => setChecked(true)}>检查答案</button>
+        <button onClick={() => { setAnswer(createEmptyDragAnswer(model)); setChecked(false); }}>重做</button>
+        {!complete && <span className="muted">请先填完所有槽位。</span>}
+        {correct === true && <span className="result correct">全部正确</span>}
+        {correct === false && <span className="result wrong">还有槽位不正确</span>}
+      </div>
+    </section>
+  );
+}
+
+function HotspotPracticePanel({ model, questionId, showAnswer, translationMode, translationMap }: { model: InteractionModel; questionId: string; showAnswer: boolean; translationMode: TranslationMode; translationMap: Map<string, string> }) {
+  const [answer, setAnswer] = useState<HotspotUserAnswer>(() => createEmptyHotspotAnswer(model));
+  const [checked, setChecked] = useState(false);
+  const complete = isHotspotComplete(model, answer);
+  const correct = checked ? gradeHotspot(model, answer) : null;
+
+  useEffect(() => {
+    setAnswer(createEmptyHotspotAnswer(model));
+    setChecked(false);
+  }, [model, questionId]);
+
+  return (
+    <section className="interaction-panel">
+      <h4>Hotspot 下拉练习</h4>
+      <div className="info-box">{model.message || '检测到结构化交互数据：请先选择每个下拉框，再检查答案。'}</div>
+      <HotspotQuestion model={model} value={answer} onChange={(value) => { setAnswer(value); setChecked(false); }} showAnswer={showAnswer || checked} translationMode={translationMode} translationMap={translationMap} />
+      <div className="drag-practice-actions">
+        <button className="primary" disabled={!complete} onClick={() => setChecked(true)}>检查答案</button>
+        <button onClick={() => { setAnswer(createEmptyHotspotAnswer(model)); setChecked(false); }}>重做</button>
+        {!complete && <span className="muted">请先完成所有下拉选择。</span>}
+        {correct === true && <span className="result correct">全部正确</span>}
+        {correct === false && <span className="result wrong">还有选择不正确</span>}
+      </div>
+    </section>
+  );
+}
+
+function InteractionPanel({ model, showAnswer }: { model: InteractionModel; showAnswer: boolean }) {
   return (
     <section className="interaction-panel">
       <h4>复杂题型交互框架</h4>
@@ -111,23 +167,9 @@ function InteractionPanel({ model }: { model: InteractionModel }) {
           {model.rows.map((row) => (
             <div className="answer-row" key={row.id}>
               <span>{row.prompt}</span>
-              <strong>{row.correct_selection || row.option_group || '待选择'}</strong>
+              <strong>{showAnswer ? row.correct_selection || row.option_group || '待选择' : row.option_group || '待作答'}</strong>
             </div>
           ))}
-        </div>
-      )}
-      {model.slots.length > 0 && (
-        <div className="drag-shell">
-          <div>
-            <h4>候选项池</h4>
-            {model.options.map((option) => <span key={option.key}>{option.text}</span>)}
-          </div>
-          <div>
-            <h4>槽位</h4>
-            {model.slots.map((slot) => (
-              <div className="slot-row" key={slot.id}>{slot.label} → {slot.correct_option || '待填入'}</div>
-            ))}
-          </div>
         </div>
       )}
     </section>
@@ -163,7 +205,12 @@ export default function QuestionPanel(props: {
   hideActions?: boolean;
   hideAnswerAreas?: boolean;
   selectedOptions?: string[];
+  dragAnswer?: DragDropUserAnswer | null;
+  hotspotAnswer?: HotspotUserAnswer | null;
+  historyUserAnswer?: string | null;
   onOptionSelect?: (key: string) => void;
+  onDragAnswerChange?: (value: DragDropUserAnswer) => void;
+  onHotspotAnswerChange?: (value: HotspotUserAnswer) => void;
   onReturn?: () => void;
   onToggleFlag?: (flagType: string) => void;
   onAiPrompt?: (value: string) => void;
@@ -183,6 +230,8 @@ export default function QuestionPanel(props: {
   const translationMap = createTranslationMap(props.translations || []);
   const translationMode = props.translationMode || 'original';
   const interactiveOptions = Boolean(props.onOptionSelect);
+  const isStructuredDrag = props.interaction?.kind === 'drag_drop' && props.interaction.slots.length > 0;
+  const isStructuredHotspot = props.interaction?.kind === 'hotspot' && props.interaction.rows.length > 0 && props.interaction.options.length > 0;
   const scrollPanel = (position: 'top' | 'bottom') => {
     const element = panelRef.current;
     if (!element) return;
@@ -266,7 +315,7 @@ export default function QuestionPanel(props: {
         </section>
       )}
 
-      {!props.hideAnswerAreas && detail.answer_areas.length > 0 && (
+      {!props.hideAnswerAreas && detail.answer_areas.length > 0 && props.showAnswer && (
         <section>
           <h4>答案区</h4>
           <div className="answer-table">
@@ -280,7 +329,31 @@ export default function QuestionPanel(props: {
         </section>
       )}
 
-      {!props.compact && shouldShowInteraction(props.interaction) && <InteractionPanel model={props.interaction!} />}
+      {props.interaction?.kind === 'drag_drop' && props.interaction.slots.length > 0 && props.compact && (
+        <DragDropQuestion model={props.interaction} value={props.dragAnswer} onChange={props.onDragAnswerChange} translationMode={translationMode} translationMap={translationMap} />
+      )}
+
+      {isStructuredHotspot && props.compact && (
+        <HotspotQuestion model={props.interaction!} value={props.hotspotAnswer} onChange={props.onHotspotAnswerChange} translationMode={translationMode} translationMap={translationMap} />
+      )}
+
+      {props.interaction?.kind === 'drag_drop' && props.interaction.slots.length > 0 && !props.compact && props.historyUserAnswer && (
+        <DragDropQuestion model={props.interaction} value={parseDragAnswer(props.historyUserAnswer)} showAnswer disabled translationMode={translationMode} translationMap={translationMap} />
+      )}
+
+      {isStructuredHotspot && !props.compact && props.historyUserAnswer && (
+        <HotspotQuestion model={props.interaction!} value={parseHotspotAnswer(props.historyUserAnswer)} showAnswer disabled translationMode={translationMode} translationMap={translationMap} />
+      )}
+
+      {props.interaction?.kind === 'drag_drop' && props.interaction.slots.length > 0 && !props.compact && !props.historyUserAnswer && (
+        <DragDropPracticePanel model={props.interaction} questionId={detail.id} showAnswer={props.showAnswer} translationMode={translationMode} translationMap={translationMap} />
+      )}
+
+      {isStructuredHotspot && !props.compact && !props.historyUserAnswer && (
+        <HotspotPracticePanel model={props.interaction!} questionId={detail.id} showAnswer={props.showAnswer} translationMode={translationMode} translationMap={translationMap} />
+      )}
+
+      {!props.compact && shouldShowInteraction(props.interaction) && !(props.interaction?.kind === 'drag_drop' && props.interaction.slots.length > 0) && !isStructuredHotspot && <InteractionPanel model={props.interaction!} showAnswer={props.showAnswer} />}
 
       {props.showAnswer && (
         <section className="answer-box">

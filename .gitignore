@@ -3,3 +3,5 @@ target/
 output/
 *.pdf
 .pdf
+__pycache__/
+*.pyc

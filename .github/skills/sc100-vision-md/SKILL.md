@@ -1,6 +1,6 @@
 ---
 name: sc100-vision-md
-description: 'Use when: continuing SC-100/exam PDF question-bank processing, prompts like 继续处理/继续/下一批/接着做, visual page reading, PDF screenshots, HOTSPOT/DRAG DROP, auto-detect next pages/questions from output/vision-md, 10 questions per Markdown, answer verification, Chinese answer recommendations, carryover across page boundaries.'
+description: 'Use when: continuing SC-100/exam PDF question-bank processing, prompts like 继续处理/继续/下一批/接着做, visual page reading, PDF screenshots, HOTSPOT/DRAG DROP, auto-detect next pages/questions from output/vision-md, default 10 questions per Markdown (user can override), answer verification, Chinese answer recommendations, carryover across page boundaries.'
 argument-hint: 'Optional: PDF path or page range; otherwise auto-detect next batch from existing output/vision-md'
 ---
 
@@ -10,7 +10,7 @@ argument-hint: 'Optional: PDF path or page range; otherwise auto-detect next bat
 
 Turn an image-heavy SC-100/exam PDF into reliable, review-friendly Markdown batches by visually reading rendered PDF pages, not by blindly trusting OCR or source answers.
 
-The output is **10 questions per Markdown file**. Each question must include the question text, choices or answer area, the source answer, my recommended answer, Chinese reasoning, source pages, status, and carryover notes.
+The output defaults to **10 questions per Markdown file** unless the user specifies a different number (e.g. "处理 5 道" or "这次 20 题"). Each question must include the question text, choices or answer area, the source answer, my recommended answer, Chinese reasoning, source pages, status, and carryover notes.
 
 ## When to Use
 
@@ -30,7 +30,27 @@ Use this skill for prompts such as:
 - “给出中文答案建议和你的看法”
 
 If the user only says “继续处理”, do **not** ask for page numbers. First inspect the existing outputs and decide the next batch yourself.
+### Regenerate Mode
 
+Use this mode for prompts such as:
+
+- "重新生成 Q23"
+- "Q23 质量不好，重做"
+- "重写第 23、32 题"
+- "Q42 答案有问题，重新处理"
+
+Procedure:
+
+1. **Locate** — `grep -rn "## Question 23" output/vision-md/` to find the Markdown file containing the target question(s).
+2. **Re-read source** — Open the source PDF pages noted in the question's `Source Pages` field. Re-render if needed. Visually re-read the question, options, answer area, and any HOTSPOT/DRAG DROP structure.
+3. **Replace** — Overwrite only the `## Question <n>` block in the existing Markdown file (from `## Question <n>` to the line before the next `## Question` or end of file). Keep all other questions untouched.
+4. **Re-import** — Run the import script with `--reset` to rebuild the entire SQLite database from all Markdown files:
+   ```powershell
+   python .github/skills/sc100-vision-md/scripts/import_question_md_to_sqlite.py --input output/vision-md --exam SC-100 --db question-banks/SC-100.sqlite --reset
+   ```
+5. **Sync** — Copy the updated `.sqlite` to AppData if needed.
+
+Do NOT create a new Markdown file for regenerated questions. Edit in-place in the original file.
 ## Core Principles
 
 1. **Visual first, OCR second**
@@ -78,7 +98,7 @@ Default behavior:
 - Continue from `latest_page_to + 1`.
 - Render a tentative 30-page window.
 - Visually inspect actual question boundaries.
-- Stop the Markdown after 10 complete questions, not necessarily after the tentative page window.
+- Stop the Markdown after the target number of complete questions (default 10, or user-specified), not necessarily after the tentative page window.
 - If the next page starts with continuation from the previous question, attach it to prior carryover notes before starting the new question batch.
 
 Only ask the user for clarification if no PDF exists or no previous output exists and multiple PDFs are present.
@@ -161,7 +181,48 @@ When judging correctness:
    - “dashboard/custom views” in Sentinel usually points to workbooks.
    - “SOAR/minimize manual intervention” in Sentinel usually points to playbooks.
    - “request access via My Apps + approval” usually points to Identity Governance access packages.
-5. For HOTSPOT, represent answers as a Markdown table instead of forcing A/B/C/D choices.
+5. For HOTSPOT, do not force A/B/C/D choices. First classify the interaction using [structured-interactions.md](./assets/structured-interactions.md):
+   - dropdown-like multi-row HOTSPOT → output `Hotspot Options` and `Hotspot Rows`.
+   - ordered steps/list placement → output `Drag Options` and `Ordered Slots`.
+   - visual image click target → output `Visual Target Notes` and mark `needs_review` unless coordinates are explicitly captured.
+   - only fall back to plain `Answer Area` when the visual structure cannot be confirmed.
+
+## Structured Interaction Rules
+
+Before writing any HOTSPOT, DRAG DROP, ordered-list, table-selection, or screenshot-based question, read [structured-interactions.md](./assets/structured-interactions.md).
+
+Key rule: treat most complex questions as one unified data model: a visually ordered candidate option pool on the left, and an ordered target/answer area on the right. If the PDF image shows enough information to identify candidate options, target rows/slots, and correct mappings, the question is programmatically gradable and must receive a structured section. `Answer Area` is for human readability; structured sections are for SQLite import and UI grading. UI may render the same data as dropdowns, drag/drop slots, or ordered steps.
+
+## Drag Drop Structured Output
+
+DRAG DROP 题必须优先输出结构化拖拽区。`Answer Area` 可以保留给人类阅读，但程序导入和后续 UI 判分以 `Drag Options` / `Drag Slots` 为准。
+
+```markdown
+### Drag Options
+
+| Option ID | Text | Group | Distractor |
+|---|---|---|---|
+| opt-a | <candidate option text visually read from PDF> | <optional group> | No |
+| opt-b | <candidate option text visually read from PDF> | <optional group> | No |
+| opt-c | <distractor option text visually read from PDF> | <optional group> | Yes |
+
+### Drag Slots
+
+| Slot ID | Label | Correct Option ID |
+|---|---|---|
+| slot-1 | <drop target / requirement visually read from PDF> | opt-a |
+| slot-2 | <drop target / requirement visually read from PDF> | opt-b |
+```
+
+DRAG DROP 视觉整理规则：
+
+- 从 PDF 页面视觉区域提取完整候选项池，不能只写最终答案。
+- `Option ID` 必须稳定且唯一，推荐 `opt-a`、`opt-b`、`opt-c`。
+- `Slot ID` 必须稳定且唯一，推荐 `slot-1`、`slot-2`。
+- `Correct Option ID` 必须引用 `Drag Options` 中存在的 `Option ID`。
+- 判分只比较 ID，不比较显示文本，避免翻译和标点差异导致误判。
+- 如果候选项池、槽位或答案映射无法从视觉页确认，标记 `Status: needs_review`，并不要伪造 `Drag Options` / `Drag Slots`。
+- 第一版默认每个 option 最多使用一次；如果原题明确允许重复使用，在 Notes 中说明，暂不自动判分。
 
 ## Output Naming
 
@@ -173,7 +234,17 @@ output/vision-pages/sc-100-pages-<from>-<to>/page-text-<from>-<to>.txt
 output/vision-md/sc-100-pages-<from>-<to>/sc-100-questions-<start>-<end>.md
 ```
 
-If a page range does not contain exactly 10 complete questions, name by actual question range.
+If a page range does not contain exactly the target number of complete questions, name by actual question range.
+
+## SQLite Import
+
+本 skill 自带导入脚本，保持 PDF 读取 skill 目录可迁移：
+
+```powershell
+python .github/skills/sc100-vision-md/scripts/import_question_md_to_sqlite.py --input output/vision-md --exam SC-100 --db question-banks/SC-100.sqlite --reset
+```
+
+可通过 `--exam`、`--input`、`--pattern`、`--db` 处理非 SC-100 题库或不同输出路径。导入脚本写入 TauriExam 使用的 SQLite schema，包括 `questions`、`options`、`answer_areas`、`drag_options`、`drag_slots`。根目录旧导入脚本暂时保留，不作为本 skill 的必需依赖。
 
 ## Completion Checklist
 

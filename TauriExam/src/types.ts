@@ -81,6 +81,22 @@ export type InteractionModel = {
   answer_key: string[];
 };
 
+export type DragDropUserAnswer = {
+  kind: 'drag_drop';
+  slots: Array<{
+    slot_id: string;
+    option_id: string | null;
+  }>;
+};
+
+export type HotspotUserAnswer = {
+  kind: 'hotspot';
+  rows: Array<{
+    row_id: string;
+    option_id: string | null;
+  }>;
+};
+
 export type AiSettings = {
   enabled: boolean;
   base_url: string;

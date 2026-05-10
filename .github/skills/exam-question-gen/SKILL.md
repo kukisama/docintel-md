@@ -1,6 +1,6 @@
 ---
 name: exam-question-gen
-description: 'Use when: generating Microsoft certification exam question banks from scratch. Prompts like 随机生成/生成题目/出题/自测题/模拟题, specifying exam codes like AI-900, AZ-104, AZ-305, SC-200, DP-900 etc. Outputs 10 questions per Markdown file, structured for self-testing.'
+description: 'Use when: generating Microsoft certification exam question banks from scratch. Prompts like 随机生成/生成题目/出题/自测题/模拟题, specifying exam codes like AI-900, AZ-104, AZ-305, SC-200, DP-900 etc. Default 10 questions per Markdown file (user can override), structured for self-testing.'
 argument-hint: 'Required: exam code (e.g. AI-900, AZ-104). Optional: topic filter, difficulty, batch count, language.'
 ---
 
@@ -8,7 +8,7 @@ argument-hint: 'Required: exam code (e.g. AI-900, AZ-104). Optional: topic filte
 
 ## Goal
 
-基于微软官方认证课程大纲，AI 原创生成高质量模拟题，输出为结构化 Markdown 题库文件（10 题/文件），用于自测和复习。
+基于微软官方认证课程大纲，AI 原创生成高质量模拟题，输出为结构化 Markdown 题库文件（默认 10 题/文件，用户指定数量时按用户的来），用于自测和复习。
 
 题目完全由 AI 生成（无中生有），但必须严格对齐微软官方考试大纲的知识域和技能权重。
 
@@ -26,6 +26,28 @@ Use this skill for prompts such as:
 - "生成 HOTSPOT 题"
 - "出难一点的题"
 - "按某个主题出题"
+
+### Regenerate Mode
+
+Use this mode for prompts such as:
+
+- "重新生成 Q5"
+- "Q5 质量不好，重做"
+- "重写第 5、8 题"
+- "Q12 解析不对，重新出"
+
+Procedure:
+
+1. **Locate** — `grep -rn "## Question 5" output/exam-gen/<exam-code>/` to find the Markdown file containing the target question(s).
+2. **Regenerate** — Create a new question covering the same knowledge domain and difficulty, with a fresh scenario. Do not reuse the old question stem or options.
+3. **Replace** — Overwrite only the `## Question <n>` block in the existing Markdown file (from `## Question <n>` to the line before the next `## Question` or end of file). Keep all other questions untouched.
+4. **Re-import** — Run the import script with `--reset` to rebuild the entire SQLite database:
+   ```powershell
+   python .github/skills/exam-question-gen/scripts/import_question_md_to_sqlite.py --input output/exam-gen/<exam-code> --exam <exam-code> --db question-banks/<exam-code>.sqlite --reset
+   ```
+5. **Sync** — Copy the updated `.sqlite` to AppData if needed.
+
+Do NOT create a new Markdown file for regenerated questions. Edit in-place in the original file.
 
 ## Core Principles
 
@@ -77,7 +99,7 @@ Use this skill for prompts such as:
 
 ### 2. 生成题目
 
-每批生成 **10 道题目**，遵循以下规则：
+每批默认生成 **10 道题目**（用户指定数量时按用户的来），遵循以下规则：
 
 - 各题分布在不同知识域（除非用户指定某一主题）。
 - 至少包含 1 道非标准选择题（hotspot/drag_drop/yes_no_series），除非用户只要选择题。
@@ -99,7 +121,7 @@ output/exam-gen/<exam-code>/questions-<batch>-<start>-<end>.md
 ### 4. 批次续接
 
 - 检查 `output/exam-gen/<exam-code>/` 下已有文件，自动编号续接。
-- 用户说"再来一批"或"继续出题"时，自动生成下一个 10 题文件。
+- 用户说"再来一批"或"继续出题"时，自动生成下一批文件（题数沿用上一批的数量，默认 10）。
 - 避免与已生成的题目重复（检查已有文件中的题干关键词）。
 
 ## Question Template Structure
@@ -138,7 +160,7 @@ D. <option>
 <一句话总结这道题考察的核心知识点，方便复习索引。>
 ```
 
-对于 HOTSPOT / DRAG DROP 题型：
+对于 HOTSPOT / DRAG DROP / ordered-list 题型，数据层统一抽象为“候选项池 + 有序目标区”。`Answer Area` 可以保留给人读，但程序判分以 `Interaction Options` / `Interaction Targets` 为准。UI 可以把同一份数据渲染成下拉框、拖拽槽位或排序步骤：
 
 ```markdown
 ### Answer Area
@@ -148,6 +170,37 @@ D. <option>
 | <prompt 1> | <answer 1> |
 | <prompt 2> | <answer 2> |
 ```
+
+结构化交互区必须额外输出：
+
+```markdown
+### Interaction Options
+
+| Option ID | Text | Group | Distractor | Sort |
+|---|---|---|---|---:|
+| opt-a | <candidate option text> | <optional group> | No | 1 |
+| opt-b | <candidate option text> | <optional group> | No | 2 |
+| opt-c | <distractor option text> | <optional group> | Yes | 3 |
+
+### Interaction Targets
+
+| Target ID | Position | Label | Option Group | Correct Option ID |
+|---|---:|---|---|---|
+| target-1 | 1 | <first blank / first row / first slot> | <optional group> | opt-a |
+| target-2 | 2 | <second blank / second row / second slot> | <optional group> | opt-b |
+```
+
+结构化交互约束：
+
+- `Option ID` 必须稳定且唯一，推荐 `opt-a`、`opt-b`、`opt-c`。
+- `Target ID` 必须稳定且唯一，推荐 `target-1`、`target-2`。
+- `Position` 表示右侧目标区顺序，从 1 开始连续。
+- `Correct Option ID` 必须引用 `Interaction Options` 中存在的 `Option ID`。
+- 判分只比较 ID，不比较显示文本。
+- 干扰项必须保留在 `Interaction Options` 中，并标记 `Distractor = Yes`。
+- HOTSPOT 下拉题如每个下拉框候选项不同，用不同 `Group` 和 `Option Group`。
+- 排序题右侧无文本时，`Label` 使用 `Step 1`、`Step 2`、`Step 3`。
+- 第一版默认每个 option 最多使用一次，不生成需要重复使用同一 option 的题。
 
 对于 Yes/No Series 题型：
 
@@ -174,8 +227,18 @@ D. <option>
 每批完成前确认：
 
 - [ ] Markdown 文件已创建在 `output/exam-gen/<exam-code>/` 下
-- [ ] 包含正好 10 个 `## Question` 标题
+- [ ] 包含正好 N 个 `## Question` 标题（N = 用户指定数量或默认 10）
 - [ ] 每题有完整的 Options/Answer Area + Correct Answer + 解析
 - [ ] 题型分布合理
 - [ ] 知识域覆盖多个领域
 - [ ] 文件命名连续且无冲突
+
+## SQLite Import
+
+本 skill 自带导入脚本，保持 skill 目录可迁移：
+
+```powershell
+python .github/skills/exam-question-gen/scripts/import_question_md_to_sqlite.py --input output/exam-gen/<exam-code> --exam <exam-code> --db question-banks/<exam-code>.sqlite --reset
+```
+
+导入脚本职责：读取本 skill 生成的 Markdown，写入 TauriExam 使用的 SQLite schema，包括 `questions`、`options`、`answer_areas`、`interaction_options`、`interaction_targets`，并向后兼容写入 `drag_options`、`drag_slots`、`hotspot_options`、`hotspot_rows`。根目录旧导入脚本暂时保留，不作为本 skill 的必需依赖。
