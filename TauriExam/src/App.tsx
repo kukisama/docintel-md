@@ -23,6 +23,7 @@ import type {
   PageImage,
   QuestionDetail,
   QuestionFlag,
+  QuestionPracticeStats,
   QuestionSummary,
   InteractionModel,
   ReviewMode,
@@ -67,6 +68,7 @@ function App() {
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [topicFilter, setTopicFilter] = useState('all');
   const [loading, setLoading] = useState('');
   const [error, setError] = useState('');
   const [examCount, setExamCount] = useState(20);
@@ -81,6 +83,7 @@ function App() {
   const [bankHealth, setBankHealth] = useState<BankHealth | null>(null);
   const [settingsMessage, setSettingsMessage] = useState('');
   const [flags, setFlags] = useState<QuestionFlag[]>([]);
+  const [practiceStats, setPracticeStats] = useState<Record<string, QuestionPracticeStats>>({});
   const [reviewMode, setReviewMode] = useState<ReviewMode>('wrong');
   const [reviewQuestions, setReviewQuestions] = useState<QuestionSummary[]>([]);
   const [reviewSessionId, setReviewSessionId] = useState<string>('');
@@ -99,6 +102,7 @@ function App() {
   const [translationLanguage, setTranslationLanguage] = useState('zh-CN');
   const [batchTranslationBusy, setBatchTranslationBusy] = useState(false);
   const [batchTranslation, setBatchTranslation] = useState<BatchTranslateEvent | null>(null);
+  const [nowTick, setNowTick] = useState(Date.now());
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -121,6 +125,12 @@ function App() {
     if (selectedId) loadQuestion(selectedId);
   }, [selectedId]);
 
+  useEffect(() => {
+    if (view !== 'exam' || !exam) return;
+    const id = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [view, exam]);
+
   const filtered = useMemo(() => {
     const text = query.trim().toLowerCase();
     return questions.filter((question) => {
@@ -131,12 +141,14 @@ function App() {
         question.preview.toLowerCase().includes(text);
       const matchesType = typeFilter === 'all' || question.question_type === typeFilter;
       const matchesStatus = statusFilter === 'all' || question.status === statusFilter;
-      return matchesText && matchesType && matchesStatus;
+      const matchesTopic = topicFilter === 'all' || (question.topic || 'Uncategorized') === topicFilter;
+      return matchesText && matchesType && matchesStatus && matchesTopic;
     });
-  }, [questions, query, typeFilter, statusFilter]);
+  }, [questions, query, typeFilter, statusFilter, topicFilter]);
 
   const questionTypes = useMemo(() => uniqueSorted(questions.map((question) => question.question_type)), [questions]);
   const statuses = useMemo(() => uniqueSorted(questions.map((question) => question.status)), [questions]);
+  const topics = useMemo(() => uniqueSorted(questions.map((question) => question.topic || 'Uncategorized')), [questions]);
   const examPool = useMemo(
     () => questions.filter((question) => examCategories.some((category) => matchesExamCategory(question.question_type, category))),
     [questions, examCategories],
@@ -149,9 +161,12 @@ function App() {
         question.id.toLowerCase().includes(text) ||
         String(question.sequence_number).includes(text) ||
         question.preview.toLowerCase().includes(text);
-      return matchesText;
+      const matchesTopic = topicFilter === 'all' || (question.topic || 'Uncategorized') === topicFilter;
+      return matchesText && matchesTopic;
     });
-  }, [reviewQuestions, query]);
+  }, [reviewQuestions, query, topicFilter]);
+
+  const reviewTopics = useMemo(() => uniqueSorted(reviewQuestions.map((question) => question.topic || 'Uncategorized')), [reviewQuestions]);
 
   async function bootstrap() {
     try {
@@ -176,6 +191,7 @@ function App() {
       setSelectedId((current) => (loaded.some((question) => question.id === current) ? current : loaded[0]?.id || ''));
       setBankHealth(null);
       setFlags(await api.listQuestionFlags(nextBankId));
+      await refreshPracticeStats(nextBankId, loaded.map((question) => question.id));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -239,12 +255,24 @@ function App() {
       const loaded = await api.listReviewQuestions(bankId, nextMode, sessionId || undefined);
       setReviewQuestions(loaded);
       if (loaded[0]) setSelectedId(loaded[0].id);
+      await refreshPracticeStats(bankId, loaded.map((question) => question.id), true);
       setView('review');
     } catch (err) {
       setError(String(err));
     } finally {
       setLoading('');
     }
+  }
+
+  async function refreshPracticeStats(nextBankId: string, questionIds: string[], merge = false) {
+    const uniqueIds = [...new Set(questionIds.filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      if (!merge) setPracticeStats({});
+      return;
+    }
+    const stats = await api.getQuestionPracticeStats(nextBankId, uniqueIds);
+    const mapped = Object.fromEntries(stats.map((item) => [item.question_id, item]));
+    setPracticeStats((current) => (merge ? { ...current, ...mapped } : mapped));
   }
 
   async function toggleQuestionFlag(flagType: string) {
@@ -485,6 +513,7 @@ function App() {
         answers: nextAnswers,
       });
       setExam({ ...exam, answers: nextAnswers, finished: true });
+      await refreshPracticeStats(bankId, exam.questions.map((question) => question.id), true);
       await loadHistory();
       setView('history');
       return;
@@ -619,9 +648,13 @@ function App() {
               statusFilter={statusFilter}
               types={questionTypes}
               statuses={statuses}
+              topics={topics}
+              topicFilter={topicFilter}
+              practiceStats={practiceStats}
               onQuery={setQuery}
               onType={setTypeFilter}
               onStatus={setStatusFilter}
+              onTopic={setTopicFilter}
               onSelect={setSelectedId}
             />
             <QuestionPanel
@@ -699,8 +732,9 @@ function App() {
                       第 {exam.index + 1} / {exam.questions.length} 题
                     </strong>
                     <span>
-                      <Clock3 size={16} /> {Math.round((Date.now() - exam.questionStartedAt) / 1000)}s
+                      <Clock3 size={16} /> {Math.round((nowTick - exam.questionStartedAt) / 1000)}s
                     </span>
+                    {practiceStats[detail.id]?.wrong_count > 0 && <span className="wrong-count-pill">历史错过 {practiceStats[detail.id].wrong_count} 次</span>}
                   </div>
                   <QuestionPanel
                     detail={detail}
@@ -778,6 +812,7 @@ function App() {
                                 <span>第 {index + 1} 题 / 原题 Q{answer.sequence_number}</span>
                                 <span>{answer.user_answer || '未作答'}</span>
                                 <span>{formatDuration(answer.duration_seconds)}</span>
+                                <span>{answer.is_correct === false && practiceStats[answer.question_id]?.wrong_count > 0 ? `错 ${practiceStats[answer.question_id].wrong_count}` : ''}</span>
                                 <strong className={answer.is_correct ? 'ok' : answer.is_correct === false ? 'bad' : ''}>
                                   {answer.is_correct ? '正确' : answer.is_correct === false ? '错误' : '复核'}
                                 </strong>
@@ -804,7 +839,11 @@ function App() {
               query={query}
               sessions={history.filter(h => h.bank_id === bankId && h.wrong_count > 0)}
               sessionId={reviewSessionId}
+              topics={reviewTopics}
+              topicFilter={topicFilter}
+              practiceStats={practiceStats}
               onQuery={setQuery}
+              onTopic={setTopicFilter}
               onMode={(mode) => {
                 setReviewMode(mode);
                 setReviewSessionId('');

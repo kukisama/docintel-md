@@ -171,12 +171,24 @@ export type TranslatorTestResult = {
 export type QuestionSummary = {
   id: string;
   sequence_number: number;
+  topic: string | null;
   question_type: string;
   status: string;
   page_from: number | null;
   page_to: number | null;
   preview: string;
   recommended_answer: string;
+};
+
+export type QuestionPracticeStats = {
+  bank_id: string;
+  question_id: string;
+  attempt_count: number;
+  wrong_count: number;
+  latest_is_correct: boolean | null;
+  latest_answered_at: string | null;
+  avg_duration_seconds: number | null;
+  max_duration_seconds: number | null;
 };
 
 export type OptionRow = {

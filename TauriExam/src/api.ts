@@ -15,6 +15,7 @@ import type {
   PageImage,
   QuestionDetail,
   QuestionFlag,
+  QuestionPracticeStats,
   QuestionSummary,
   InteractionModel,
   ReviewMode,
@@ -68,4 +69,6 @@ export const api = {
   saveExamResult: (input: SaveExamInput) => invoke<SavedExam>('save_exam_result', { input }),
   listExamSessions: () => invoke<ExamSessionSummary[]>('list_exam_sessions'),
   listExamAnswers: (sessionId: string) => invoke<ExamAnswerDetail[]>('list_exam_answers', { sessionId }),
+  getQuestionPracticeStats: (bankId: string, questionIds: string[]) =>
+    invoke<QuestionPracticeStats[]>('get_question_practice_stats', { bankId, questionIds }),
 };

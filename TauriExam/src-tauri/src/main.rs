@@ -7,6 +7,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -69,12 +70,25 @@ struct BankEntry {
 struct QuestionSummary {
     id: String,
     sequence_number: i64,
+    topic: Option<String>,
     question_type: String,
     status: String,
     page_from: Option<i64>,
     page_to: Option<i64>,
     preview: String,
     recommended_answer: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuestionPracticeStats {
+    bank_id: String,
+    question_id: String,
+    attempt_count: i64,
+    wrong_count: i64,
+    latest_is_correct: Option<bool>,
+    latest_answered_at: Option<String>,
+    avg_duration_seconds: Option<f64>,
+    max_duration_seconds: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1362,7 +1376,7 @@ fn list_questions(bank_id: String) -> Result<Vec<QuestionSummary>, String> {
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT id, sequence_number, question_type, status, page_from, page_to,
+                 SELECT id, sequence_number, topic, question_type, status, page_from, page_to,
                    substr(replace(question_text, char(10), ' '), 1, 180) AS preview,
                    coalesce(recommended_answer, '')
             FROM questions
@@ -1376,12 +1390,13 @@ fn list_questions(bank_id: String) -> Result<Vec<QuestionSummary>, String> {
             Ok(QuestionSummary {
                 id: row.get(0)?,
                 sequence_number: row.get(1)?,
-                question_type: row.get(2)?,
-                status: row.get(3)?,
-                page_from: row.get(4)?,
-                page_to: row.get(5)?,
-                preview: row.get(6)?,
-                recommended_answer: row.get(7)?,
+                topic: row.get(2)?,
+                question_type: row.get(3)?,
+                status: row.get(4)?,
+                page_from: row.get(5)?,
+                page_to: row.get(6)?,
+                preview: row.get(7)?,
+                recommended_answer: row.get(8)?,
             })
         })
         .map_err(|err| err.to_string())?;
@@ -1723,6 +1738,93 @@ fn list_exam_answers(session_id: String) -> Result<Vec<ExamAnswerDetail>, String
 }
 
 #[tauri::command]
+fn get_question_practice_stats(bank_id: String, question_ids: Vec<String>) -> Result<Vec<QuestionPracticeStats>, String> {
+    let conn = open_app_db()?;
+    let requested: HashSet<String> = question_ids.into_iter().collect();
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut latest: HashMap<String, (Option<bool>, String)> = HashMap::new();
+    let mut latest_stmt = conn
+        .prepare(
+            r#"
+            SELECT question_id, is_correct, created_at
+            FROM exam_answers
+            WHERE bank_id = ?1
+            ORDER BY created_at DESC, rowid DESC
+            "#,
+        )
+        .map_err(|err| err.to_string())?;
+    let latest_rows = latest_stmt
+        .query_map(params![bank_id.clone()], |row| {
+            let question_id: String = row.get(0)?;
+            let is_correct: Option<i64> = row.get(1)?;
+            let created_at: String = row.get(2)?;
+            Ok((question_id, is_correct.map(|value| value != 0), created_at))
+        })
+        .map_err(|err| err.to_string())?;
+    for row in latest_rows {
+        let (question_id, is_correct, created_at) = row.map_err(|err| err.to_string())?;
+        if requested.contains(&question_id) {
+            latest.entry(question_id).or_insert((is_correct, created_at));
+        }
+    }
+
+    let mut stats_stmt = conn
+        .prepare(
+            r#"
+            SELECT question_id,
+                   COUNT(*) AS attempt_count,
+                   SUM(CASE WHEN is_correct = 0 THEN 1 ELSE 0 END) AS wrong_count,
+                   AVG(duration_seconds) AS avg_duration_seconds,
+                   MAX(duration_seconds) AS max_duration_seconds,
+                   MAX(created_at) AS latest_answered_at
+            FROM exam_answers
+            WHERE bank_id = ?1
+            GROUP BY question_id
+            "#,
+        )
+        .map_err(|err| err.to_string())?;
+
+    let rows = stats_stmt
+        .query_map(params![bank_id.clone()], |row| {
+            let question_id: String = row.get(0)?;
+            Ok((
+                question_id,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .map_err(|err| err.to_string())?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        let (question_id, attempt_count, wrong_count, avg_duration_seconds, max_duration_seconds, latest_answered_at) =
+            row.map_err(|err| err.to_string())?;
+        if !requested.contains(&question_id) {
+            continue;
+        }
+        let latest_is_correct = latest.get(&question_id).and_then(|(value, _)| *value);
+        output.push(QuestionPracticeStats {
+            bank_id: bank_id.clone(),
+            question_id,
+            attempt_count,
+            wrong_count,
+            latest_is_correct,
+            latest_answered_at,
+            avg_duration_seconds,
+            max_duration_seconds,
+        });
+    }
+
+    Ok(output)
+}
+
+#[tauri::command]
 fn list_question_flags(bank_id: String) -> Result<Vec<QuestionFlagRow>, String> {
     let conn = open_app_db()?;
     let mut stmt = conn
@@ -1788,7 +1890,7 @@ fn list_review_questions(bank_id: String, review_mode: String, session_id: Optio
         let question = conn
             .query_row(
                 r#"
-                SELECT id, sequence_number, question_type, status, page_from, page_to,
+                  SELECT id, sequence_number, topic, question_type, status, page_from, page_to,
                        substr(replace(question_text, char(10), ' '), 1, 180) AS preview,
                        coalesce(recommended_answer, '')
                 FROM questions
@@ -1799,19 +1901,21 @@ fn list_review_questions(bank_id: String, review_mode: String, session_id: Optio
                     Ok(QuestionSummary {
                         id: row.get(0)?,
                         sequence_number: row.get(1)?,
-                        question_type: row.get(2)?,
-                        status: row.get(3)?,
-                        page_from: row.get(4)?,
-                        page_to: row.get(5)?,
-                        preview: row.get(6)?,
-                        recommended_answer: row.get(7)?,
+                        topic: row.get(2)?,
+                        question_type: row.get(3)?,
+                        status: row.get(4)?,
+                        page_from: row.get(5)?,
+                        page_to: row.get(6)?,
+                        preview: row.get(7)?,
+                        recommended_answer: row.get(8)?,
                     })
                 },
             )
             .map_err(|err| err.to_string())?;
         questions.push(question);
     }
-    questions.sort_by_key(|question| question.sequence_number);
+    let order: HashMap<String, usize> = ids.into_iter().enumerate().map(|(index, id)| (id, index)).collect();
+    questions.sort_by_key(|question| order.get(&question.id).copied().unwrap_or(usize::MAX));
     Ok(questions)
 }
 
@@ -1823,9 +1927,11 @@ fn review_question_ids(bank_id: &str, review_mode: &str, session_id: Option<&str
             let mut stmt = conn
                 .prepare(
                     r#"
-                    SELECT DISTINCT question_id
+                    SELECT question_id
                     FROM exam_answers
                     WHERE bank_id = ?1 AND session_id = ?2 AND is_correct = 0
+                    GROUP BY question_id
+                    ORDER BY COUNT(*) DESC, MAX(created_at) DESC
                     "#,
                 )
                 .map_err(|err| err.to_string())?;
@@ -1838,13 +1944,31 @@ fn review_question_ids(bank_id: &str, review_mode: &str, session_id: Option<&str
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT DISTINCT question_id
-                FROM exam_answers
-                WHERE bank_id = ?1 AND is_correct = 0
-                UNION
-                SELECT question_id
-                FROM question_flags
-                WHERE bank_id = ?1 AND flag_type = 'wrong'
+                                SELECT question_id
+                                FROM (
+                                    SELECT question_id,
+                                                 COUNT(*) AS wrong_count,
+                                                 MAX(created_at) AS last_wrong_at,
+                                                 0 AS manual_only
+                                    FROM exam_answers
+                                    WHERE bank_id = ?1 AND is_correct = 0
+                                    GROUP BY question_id
+
+                                    UNION ALL
+
+                                    SELECT question_id,
+                                                 0 AS wrong_count,
+                                                 updated_at AS last_wrong_at,
+                                                 1 AS manual_only
+                                    FROM question_flags
+                                    WHERE bank_id = ?1 AND flag_type = 'wrong'
+                                        AND question_id NOT IN (
+                                            SELECT question_id
+                                            FROM exam_answers
+                                            WHERE bank_id = ?1 AND is_correct = 0
+                                        )
+                                )
+                                ORDER BY wrong_count DESC, last_wrong_at DESC, manual_only ASC
                 "#,
             )
             .map_err(|err| err.to_string())?;
@@ -2649,6 +2773,7 @@ fn main() {
             save_exam_result,
             list_exam_sessions,
             list_exam_answers,
+            get_question_practice_stats,
             list_question_flags,
             set_question_flag,
             list_review_questions,

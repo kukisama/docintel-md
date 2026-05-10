@@ -1,5 +1,5 @@
 import { Search } from 'lucide-react';
-import type { ExamSessionSummary, QuestionSummary, ReviewMode } from './types';
+import type { ExamSessionSummary, QuestionPracticeStats, QuestionSummary, ReviewMode } from './types';
 
 export function Stat({ label, value }: { label: string; value: number }) {
   return (
@@ -18,7 +18,11 @@ export function ReviewList(props: {
   query: string;
   sessions: ExamSessionSummary[];
   sessionId: string;
+  topics: string[];
+  topicFilter: string;
+  practiceStats: Record<string, QuestionPracticeStats>;
   onQuery: (value: string) => void;
+  onTopic: (value: string) => void;
   onMode: (mode: ReviewMode) => void;
   onSessionChange: (sessionId: string) => void;
   onSelect: (id: string) => void;
@@ -55,6 +59,14 @@ export function ReviewList(props: {
         <Search size={16} />
         <input value={props.query} onChange={(event) => props.onQuery(event.target.value)} placeholder="搜索复习题" />
       </div>
+      <select value={props.topicFilter} onChange={(event) => props.onTopic(event.target.value)}>
+        <option value="all">全部知识点</option>
+        {props.topics.map((topic) => (
+          <option key={topic} value={topic}>
+            {topic}
+          </option>
+        ))}
+      </select>
       <div className="list-meta">
         显示 {props.questions.length} / {props.allCount} 题
       </div>
@@ -69,7 +81,8 @@ export function ReviewList(props: {
               onClick={() => props.onSelect(question.id)}
               title={question.preview}
             >
-              {question.sequence_number}
+              <span>{question.sequence_number}</span>
+              {props.practiceStats[question.id]?.wrong_count > 0 && <em>错 {props.practiceStats[question.id].wrong_count}</em>}
             </button>
           ))
         )}
@@ -85,11 +98,15 @@ export default function QuestionList(props: {
   query: string;
   typeFilter: string;
   statusFilter: string;
+  topicFilter: string;
   types: string[];
   statuses: string[];
+  topics: string[];
+  practiceStats: Record<string, QuestionPracticeStats>;
   onQuery: (value: string) => void;
   onType: (value: string) => void;
   onStatus: (value: string) => void;
+  onTopic: (value: string) => void;
   onSelect: (id: string) => void;
 }) {
   return (
@@ -115,6 +132,14 @@ export default function QuestionList(props: {
             </option>
           ))}
         </select>
+        <select value={props.topicFilter} onChange={(event) => props.onTopic(event.target.value)}>
+          <option value="all">全部知识点</option>
+          {props.topics.map((topic) => (
+            <option key={topic} value={topic}>
+              {topic}
+            </option>
+          ))}
+        </select>
       </div>
       <div className="list-meta">
         显示 {props.questions.length} / {props.allCount} 题
@@ -127,7 +152,8 @@ export default function QuestionList(props: {
             onClick={() => props.onSelect(question.id)}
             title={question.preview}
           >
-            {question.sequence_number}
+              <span>{question.sequence_number}</span>
+              {props.practiceStats[question.id]?.wrong_count > 0 && <em>错 {props.practiceStats[question.id].wrong_count}</em>}
           </button>
         ))}
       </div>

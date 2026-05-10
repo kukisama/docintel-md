@@ -327,10 +327,12 @@ p {
 
 .q-num {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 1px;
   min-width: 0;
-  height: 30px;
+  min-height: 38px;
   border-radius: 8px;
   font-size: 12px;
   font-weight: 600;
@@ -338,6 +340,13 @@ p {
   color: var(--text);
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
+}
+
+.q-num em {
+  font-style: normal;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--bad);
 }
 
 .q-num:hover {
@@ -348,6 +357,10 @@ p {
   background: var(--primary);
   color: #fff;
   border-color: var(--primary);
+}
+
+.q-num.active em {
+  color: #fff;
 }
 
 .question-card {
@@ -680,6 +693,16 @@ p {
   color: var(--bad);
 }
 
+.wrong-count-pill {
+  color: var(--bad);
+  border: 1px solid rgba(220, 38, 38, 0.28);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(220, 38, 38, 0.08);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .history-panel {
   display: grid;
   gap: 16px;
@@ -989,11 +1012,11 @@ p {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 34px;
+  height: 34px;
   padding: 0;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--panel);
   color: var(--fg);
   cursor: pointer;
@@ -1348,7 +1371,7 @@ p {
 .history-answer-row {
   width: 100%;
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(80px, 140px) 90px 70px;
+  grid-template-columns: minmax(220px, 1fr) minmax(80px, 140px) 90px 56px 70px;
   gap: 12px;
   text-align: left;
   justify-content: stretch;

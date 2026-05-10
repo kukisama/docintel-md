@@ -1,7 +1,7 @@
 import { useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ArrowDown, ArrowUp, ChevronLeft, ChevronRight, Star } from 'lucide-react';
+import { ArrowDown, ArrowUp, ChevronsLeft, ChevronsRight, Star } from 'lucide-react';
 import type { InteractionModel, PageImage, QuestionDetail, TranslationRow } from './types';
 import type { TranslationMode } from './helpers';
 import { expectedLetters, optionClassName, shouldShowInteraction, createTranslationMap, translatedNode } from './helpers';
@@ -33,16 +33,12 @@ function TranslationPanel(props: {
           <button className={props.mode === 'translated' ? 'active' : ''} onClick={() => props.onMode('translated')}>翻译</button>
           <button className={props.mode === 'side_by_side' ? 'active' : ''} onClick={() => props.onMode('side_by_side')}>对照</button>
         </div>
-        {(props.onPrev || props.onNext) && (
-          <div className="nav-icon-group">
-            <button className="icon-btn" disabled={!props.onPrev} onClick={props.onPrev} title="上一题">
-              <ChevronLeft size={16} />
-            </button>
-            <button className="icon-btn" disabled={!props.onNext} onClick={props.onNext} title="下一题">
-              <ChevronRight size={16} />
-            </button>
-          </div>
-        )}
+        <div className="toolbar-spacer" />
+        <div className="action-row compact-actions">
+          <input value={props.language} onChange={(event) => props.onLanguage?.(event.target.value)} />
+          <button disabled={props.busy} onClick={() => props.onTranslate(false)} title="优先读取缓存">翻译</button>
+          <button disabled={props.busy} onClick={() => props.onTranslate(true)}>重新翻译</button>
+        </div>
       </div>
       <div className="toolbar-row">
         <div className="action-row compact-actions">
@@ -60,12 +56,16 @@ function TranslationPanel(props: {
               </button>
             </>
           )}
-        </div>
-        <div className="toolbar-spacer" />
-        <div className="action-row compact-actions">
-          <input value={props.language} onChange={(event) => props.onLanguage?.(event.target.value)} />
-          <button disabled={props.busy} onClick={() => props.onTranslate(false)} title="优先读取缓存">翻译</button>
-          <button disabled={props.busy} onClick={() => props.onTranslate(true)}>重新翻译</button>
+          {(props.onPrev || props.onNext) && (
+            <>
+              <button className="icon-btn" disabled={!props.onPrev} onClick={props.onPrev} title="上一题">
+                <ChevronsLeft size={20} strokeWidth={2.5} />
+              </button>
+              <button className="icon-btn" disabled={!props.onNext} onClick={props.onNext} title="下一题">
+                <ChevronsRight size={20} strokeWidth={2.5} />
+              </button>
+            </>
+          )}
         </div>
       </div>
     </section>
