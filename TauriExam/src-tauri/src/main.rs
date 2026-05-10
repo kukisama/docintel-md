@@ -1886,7 +1886,7 @@ fn list_review_questions(bank_id: String, review_mode: String, session_id: Optio
     }
     let conn = open_bank(&bank_id)?;
     let mut questions = Vec::new();
-    for id in ids {
+    for id in &ids {
         let question = conn
             .query_row(
                 r#"
