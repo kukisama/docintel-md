@@ -128,7 +128,7 @@ function App() {
   }, [bankId]);
 
   useEffect(() => {
-    if (selectedId) loadQuestion(selectedId);
+    if (selectedId) loadQuestion(bankId, selectedId);
   }, [selectedId]);
 
   useEffect(() => {
@@ -186,6 +186,14 @@ function App() {
   const isCurrentDragLike = Boolean(detail?.question_type.toLowerCase().includes('drag') || detail?.question_type.toLowerCase().includes('drop'));
   const isCurrentHotspotLike = Boolean(detail?.question_type.toLowerCase().includes('hotspot'));
 
+  function isBankAvailable(candidateBankId: string) {
+    return banks.some((bank) => bank.id === candidateBankId);
+  }
+
+  function missingBankMessage(candidateBankId: string) {
+    return `这条记录属于题库 ${candidateBankId}，但当前题库目录里没有对应的 SQLite。缺 PDF 只会影响点击 PDF 按钮；缺 SQLite 无法读取题干。请把 ${candidateBankId}.sqlite 放回 question-banks 后刷新题库。`;
+  }
+
   async function bootstrap() {
     try {
       setError('');
@@ -206,7 +214,16 @@ function App() {
       setError('');
       const loaded = await api.listQuestions(nextBankId);
       setQuestions(loaded);
-      setSelectedId((current) => (loaded.some((question) => question.id === current) ? current : loaded[0]?.id || ''));
+      const nextSelectedId = loaded.some((question) => question.id === selectedId) ? selectedId : loaded[0]?.id || '';
+      setSelectedId(nextSelectedId);
+      if (!nextSelectedId) {
+        setDetail(null);
+        setInteraction(null);
+        setTranslations([]);
+        setPages([]);
+      } else if (nextSelectedId === selectedId) {
+        await loadQuestion(nextBankId, nextSelectedId);
+      }
       setBankHealth(null);
       setFlags(await api.listQuestionFlags(nextBankId));
       await refreshPracticeStats(nextBankId, loaded.map((question) => question.id));
@@ -217,15 +234,15 @@ function App() {
     }
   }
 
-  async function loadQuestion(questionId: string) {
+  async function loadQuestion(nextBankId: string, questionId: string) {
     try {
       setLoading('正在读取题目...');
       setError('');
       setInteraction(null);
-      const loaded = await api.getQuestion(bankId, questionId);
+      const loaded = await api.getQuestion(nextBankId, questionId);
       setDetail(loaded);
-      setInteraction(await api.getInteractionModel(bankId, questionId));
-      setTranslations(await api.getCachedTranslations(bankId, questionId, translationLanguage));
+      setInteraction(await api.getInteractionModel(nextBankId, questionId));
+      setTranslations(await api.getCachedTranslations(nextBankId, questionId, translationLanguage));
       setPages([]);
       setShowAnswer(false);
       setAiAnswer('');
@@ -271,10 +288,14 @@ function App() {
     try {
       setLoading('正在读取复习题...');
       setError('');
-      const loaded = await api.listReviewQuestions(bankId, nextMode, sessionId || undefined);
+      const effectiveBankId = banks.length > 0 && !isBankAvailable(bankId) ? banks[0].id : bankId;
+      if (effectiveBankId !== bankId) {
+        setBankId(effectiveBankId);
+      }
+      const loaded = await api.listReviewQuestions(effectiveBankId, nextMode, sessionId || undefined);
       setReviewQuestions(loaded);
       if (loaded[0]) setSelectedId(loaded[0].id);
-      await refreshPracticeStats(bankId, loaded.map((question) => question.id), true);
+      await refreshPracticeStats(effectiveBankId, loaded.map((question) => question.id), true);
       setView('review');
     } catch (err) {
       setError(String(err));
@@ -308,7 +329,7 @@ function App() {
       });
       setFlags(updated);
       if (view === 'review') {
-        setReviewQuestions(await api.listReviewQuestions(bankId, reviewMode));
+        setReviewQuestions(await api.listReviewQuestions(bankId, reviewMode, reviewSessionId || undefined));
       }
     } catch (err) {
       setError(String(err));
@@ -622,6 +643,11 @@ function App() {
   }
 
   function openHistoryQuestion(answer: ExamAnswerDetail) {
+    if (!isBankAvailable(answer.bank_id)) {
+      setError(missingBankMessage(answer.bank_id));
+      return;
+    }
+    setError('');
     setBankId(answer.bank_id);
     setSelectedId(answer.question_id);
     setReturnContext({ view: 'history', sessionId: answer.session_id, label: '返回本次考试记录' });
@@ -807,13 +833,21 @@ function App() {
                     onToggleAnswer={() => undefined}
                     onTogglePages={() => undefined}
                     compact
+                    translationToolbarOnly
                     hideActions
                     hideAnswerAreas
                     pagesBusy={pagesBusy}
                     interaction={interaction}
+                    translations={translations}
+                    translationMode={translationMode}
+                    translationLanguage={translationLanguage}
+                    translationBusy={translationBusy}
                     selectedOptions={exam.selected}
                     dragAnswer={currentDragAnswer}
                     hotspotAnswer={currentHotspotAnswer}
+                    onTranslationMode={setTranslationMode}
+                    onTranslationLanguage={setTranslationLanguage}
+                    onTranslate={translateCurrentQuestion}
                     onOptionSelect={toggleChoice}
                     onDragAnswerChange={updateDragAnswer}
                     onHotspotAnswerChange={updateHotspotAnswer}

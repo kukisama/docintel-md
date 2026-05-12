@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Import standardized SC-100 vision Markdown batches into SQLite."""
+"""DEPRECATED: Import standardized SC-100 vision Markdown batches into SQLite.
+
+Use .github/skills/sc100-vision-md/scripts/import_question_md_to_sqlite.py instead.
+This legacy importer writes an older schema and does not fully support the unified
+interaction_options / interaction_targets model consumed by current TauriExam.
+"""
 
 from __future__ import annotations
 

@@ -51,16 +51,21 @@ param(
     [string]$Effort = 'medium',
     [switch]$SkipImport,
     [switch]$DryRun,
-    [string]$Python = 'C:/Users/kukisama/AppData/Local/Programs/Python/Python312/python.exe',
+    [string]$Python = '',
+    [switch]$NoInstallPython,
   [string]$Db = 'question-banks/SC-100.sqlite',
   [string]$Exam = 'SC-100',
   [string]$InputRoot = 'output/vision-md'
 )
 
-$DetectScript = '.github/skills/sc100-vision-md/scripts/detect_missing_interactions.py'
-$ImportScript = '.github/skills/sc100-vision-md/scripts/import_question_md_to_sqlite.py'
-
 $ErrorActionPreference = 'Stop'
+
+$Root = $PSScriptRoot
+$Python = & (Join-Path $Root 'scripts/Resolve-Python.ps1') -PreferredPython $Python -InstallIfMissing:(-not $NoInstallPython)
+$DetectScript = Join-Path $Root '.github/skills/sc100-vision-md/scripts/detect_missing_interactions.py'
+$ImportScript = Join-Path $Root '.github/skills/sc100-vision-md/scripts/import_question_md_to_sqlite.py'
+if (-not [System.IO.Path]::IsPathRooted($Db)) { $Db = Join-Path $Root $Db }
+if (-not [System.IO.Path]::IsPathRooted($InputRoot)) { $InputRoot = Join-Path $Root $InputRoot }
 
 function Convert-ToQuestionSet {
   param([string]$Value)
@@ -254,7 +259,7 @@ print(json.dumps([dict(row) for row in rows], ensure_ascii=False))
 function Sync-DbCopies {
   $targets = @(
     (Join-Path $env:LOCALAPPDATA 'TauriExam/question-banks/SC-100.sqlite'),
-    'TauriExam/question-banks/SC-100.sqlite'
+    (Join-Path $Root 'TauriExam/question-banks/SC-100.sqlite')
   )
 
   foreach ($target in $targets) {

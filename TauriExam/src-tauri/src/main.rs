@@ -1887,32 +1887,33 @@ fn list_review_questions(bank_id: String, review_mode: String, session_id: Optio
     let conn = open_bank(&bank_id)?;
     let mut questions = Vec::new();
     for id in &ids {
-        let question = conn
-            .query_row(
-                r#"
-                  SELECT id, sequence_number, topic, question_type, status, page_from, page_to,
-                       substr(replace(question_text, char(10), ' '), 1, 180) AS preview,
-                       coalesce(recommended_answer, '')
-                FROM questions
-                WHERE id = ?1
-                "#,
-                params![id],
-                |row| {
-                    Ok(QuestionSummary {
-                        id: row.get(0)?,
-                        sequence_number: row.get(1)?,
-                        topic: row.get(2)?,
-                        question_type: row.get(3)?,
-                        status: row.get(4)?,
-                        page_from: row.get(5)?,
-                        page_to: row.get(6)?,
-                        preview: row.get(7)?,
-                        recommended_answer: row.get(8)?,
-                    })
-                },
-            )
-            .map_err(|err| err.to_string())?;
-        questions.push(question);
+        match conn.query_row(
+            r#"
+              SELECT id, sequence_number, topic, question_type, status, page_from, page_to,
+                   substr(replace(question_text, char(10), ' '), 1, 180) AS preview,
+                   coalesce(recommended_answer, '')
+            FROM questions
+            WHERE id = ?1
+            "#,
+            params![id],
+            |row| {
+                Ok(QuestionSummary {
+                    id: row.get(0)?,
+                    sequence_number: row.get(1)?,
+                    topic: row.get(2)?,
+                    question_type: row.get(3)?,
+                    status: row.get(4)?,
+                    page_from: row.get(5)?,
+                    page_to: row.get(6)?,
+                    preview: row.get(7)?,
+                    recommended_answer: row.get(8)?,
+                })
+            },
+        ) {
+            Ok(question) => questions.push(question),
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(err) => return Err(err.to_string()),
+        }
     }
     let order: HashMap<String, usize> = ids.into_iter().enumerate().map(|(index, id)| (id, index)).collect();
     questions.sort_by_key(|question| order.get(&question.id).copied().unwrap_or(usize::MAX));

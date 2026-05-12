@@ -1,9 +1,10 @@
 param(
     [string]$Pdf = "SC-100 题目+答案+讨论.pdf",
-    [string]$Python = "C:/Users/kukisama/AppData/Local/Programs/Python/Python312/python.exe",
+    [string]$Python = "",
     [int]$PagesPerBatch = 30,
     [switch]$RenderAndExtract,
-    [switch]$OpenPrompt
+    [switch]$OpenPrompt,
+    [switch]$NoInstallPython
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,13 +14,11 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $env:PYTHONIOENCODING = "utf-8"
 
 $SkillRoot = Split-Path -Parent $PSScriptRoot
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..\..')).Path
+$Python = & (Join-Path $RepoRoot 'scripts/Resolve-Python.ps1') -PreferredPython $Python -InstallIfMissing:(-not $NoInstallPython)
 $DetectScript = Join-Path $PSScriptRoot "detect_next_batch.py"
 $RenderScript = Join-Path $PSScriptRoot "render_pdf_pages.py"
 $ExtractScript = Join-Path $PSScriptRoot "extract_page_text.py"
-
-if (-not (Test-Path $Python)) {
-    throw "Python not found: $Python"
-}
 
 $stateJson = & $Python $DetectScript --pdf $Pdf --pages-per-batch $PagesPerBatch
 if ($LASTEXITCODE -ne 0) {

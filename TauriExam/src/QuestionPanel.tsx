@@ -13,6 +13,7 @@ function TranslationPanel(props: {
   mode: TranslationMode;
   language: string;
   busy: boolean;
+  showStudyActions?: boolean;
   showAnswer: boolean;
   showPages: boolean;
   pagesBusy?: boolean;
@@ -42,34 +43,36 @@ function TranslationPanel(props: {
           <button disabled={props.busy} onClick={() => props.onTranslate(true)}>重新翻译</button>
         </div>
       </div>
-      <div className="toolbar-row">
-        <div className="action-row compact-actions">
-          <button className={props.showAnswer ? 'primary' : ''} onClick={props.onToggleAnswer}>答案</button>
-          <button className={props.showPages ? 'primary' : ''} onClick={props.onTogglePages} disabled={props.pagesBusy}>
-            {props.pagesBusy ? '...' : 'PDF'}
-          </button>
-          {props.onAskAi && (
-            <>
-              <button disabled={!(props.aiEnabled) || (props.aiBusy ?? false)} onClick={() => props.onAskAi!('analyze')}>
-                {props.aiBusy ? '...' : 'AI分析'}
-              </button>
-              <button disabled={!(props.aiEnabled) || (props.aiBusy ?? false)} onClick={() => props.onAskAi!('summarize')}>
-                AI总结
-              </button>
-            </>
-          )}
-          {(props.onPrev || props.onNext) && (
-            <>
-              <button className="icon-btn" disabled={!props.onPrev} onClick={props.onPrev} title="上一题">
-                <ChevronsLeft size={20} strokeWidth={2.5} />
-              </button>
-              <button className="icon-btn" disabled={!props.onNext} onClick={props.onNext} title="下一题">
-                <ChevronsRight size={20} strokeWidth={2.5} />
-              </button>
-            </>
-          )}
+      {props.showStudyActions !== false && (
+        <div className="toolbar-row">
+          <div className="action-row compact-actions">
+            <button className={props.showAnswer ? 'primary' : ''} onClick={props.onToggleAnswer}>答案</button>
+            <button className={props.showPages ? 'primary' : ''} onClick={props.onTogglePages} disabled={props.pagesBusy}>
+              {props.pagesBusy ? '...' : 'PDF'}
+            </button>
+            {props.onAskAi && (
+              <>
+                <button disabled={!(props.aiEnabled) || (props.aiBusy ?? false)} onClick={() => props.onAskAi!('analyze')}>
+                  {props.aiBusy ? '...' : 'AI分析'}
+                </button>
+                <button disabled={!(props.aiEnabled) || (props.aiBusy ?? false)} onClick={() => props.onAskAi!('summarize')}>
+                  AI总结
+                </button>
+              </>
+            )}
+            {(props.onPrev || props.onNext) && (
+              <>
+                <button className="icon-btn" disabled={!props.onPrev} onClick={props.onPrev} title="上一题">
+                  <ChevronsLeft size={20} strokeWidth={2.5} />
+                </button>
+                <button className="icon-btn" disabled={!props.onNext} onClick={props.onNext} title="下一题">
+                  <ChevronsRight size={20} strokeWidth={2.5} />
+                </button>
+              </>
+            )}
+          </div>
         </div>
-      </div>
+      )}
     </section>
   );
 }
@@ -202,6 +205,7 @@ export default function QuestionPanel(props: {
   pagesBusy?: boolean;
   returnLabel?: string;
   compact?: boolean;
+  translationToolbarOnly?: boolean;
   hideActions?: boolean;
   hideAnswerAreas?: boolean;
   selectedOptions?: string[];
@@ -265,12 +269,13 @@ export default function QuestionPanel(props: {
         </div>
       )}
 
-      {!props.compact && props.translationMode && props.onTranslationMode && props.onTranslate && (
+      {props.translationMode && props.onTranslationMode && props.onTranslate && (
         <TranslationPanel
           rows={props.translations || []}
           mode={props.translationMode}
           language={props.translationLanguage || 'zh-CN'}
           busy={props.translationBusy ?? false}
+          showStudyActions={!props.translationToolbarOnly}
           showAnswer={props.showAnswer}
           showPages={props.pages.length > 0}
           pagesBusy={props.pagesBusy}

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Import AI-generated exam Markdown batches into SQLite for TauriExam.
+"""DEPRECATED: Import AI-generated exam Markdown batches into SQLite for TauriExam.
+
+Use .github/skills/exam-question-gen/scripts/import_question_md_to_sqlite.py instead.
+This legacy importer is kept only for historical compatibility.
 
 Usage:
     python scripts/import_exam_gen_to_sqlite.py --input output/exam-gen/AI-900
