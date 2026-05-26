@@ -61,9 +61,9 @@ jobs:
 
       - name: Setup Rust toolchain
         if: ${{ matrix.enabled == true }}
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
+        run: |
+          rustup toolchain install stable --target ${{ matrix.rust_target }}
+          rustup default stable
 
       - name: Cache cargo registry & target
         if: ${{ matrix.enabled == true }}

@@ -32,9 +32,9 @@ jobs:
           cache-dependency-path: TauriExam/package-lock.json
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+        run: |
+          rustup toolchain install stable --target x86_64-pc-windows-msvc
+          rustup default stable
 
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
