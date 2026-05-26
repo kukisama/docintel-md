@@ -34,7 +34,9 @@ jobs:
             rust_target: aarch64-apple-darwin
             pdfium_asset: pdfium-mac-arm64.tgz
             enabled: true
-          - os: macos-13
+          # x64 也跑在 macos-14（Apple Silicon）上，通过 rustc 交叉编译产出 x86_64
+          # 二进制；GitHub 的 macos-13 (Intel) runner 容量紧张，经常长时间排队。
+          - os: macos-14
             label: macos-x64
             rust_target: x86_64-apple-darwin
             pdfium_asset: pdfium-mac-x64.tgz
