@@ -375,9 +375,31 @@ fn exe_dir() -> Option<PathBuf> {
 }
 
 fn app_data_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("LOCALAPPDATA") {
-        return Ok(PathBuf::from(path).join(APP_DIR_NAME));
+    // Windows: %LOCALAPPDATA%\TauriExam
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(path) = std::env::var("LOCALAPPDATA") {
+            return Ok(PathBuf::from(path).join(APP_DIR_NAME));
+        }
     }
+    // macOS: ~/Library/Application Support/TauriExam
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return Ok(PathBuf::from(home).join("Library/Application Support").join(APP_DIR_NAME));
+        }
+    }
+    // Linux / fallback: $XDG_DATA_HOME or ~/.local/share/TauriExam
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            return Ok(PathBuf::from(xdg).join(APP_DIR_NAME));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return Ok(PathBuf::from(home).join(".local/share").join(APP_DIR_NAME));
+        }
+    }
+    // Dev / unknown environment fallback
     Ok(workspace_root()?.join("output/exam-tool"))
 }
 
@@ -401,23 +423,21 @@ fn legacy_question_bank_roots() -> Result<Vec<PathBuf>, String> {
     Ok(roots)
 }
 
-fn has_bank_files(dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| is_supported_sqlite(&entry.path()))
-}
-
 fn migrate_question_bank_files(target: &Path) -> Result<(), String> {
-    if has_bank_files(target) {
-        return Ok(());
-    }
+    // Per-file migration: for every legacy root, copy any bank asset that
+    // does not yet exist in the target. We intentionally do NOT short-circuit
+    // on `has_bank_files(target)` because companion files (e.g. translation
+    // databases `<bank>.translations.sqlite`, PDFs) may be added to the
+    // legacy folder after the main `.sqlite` has already been migrated.
     for root in legacy_question_bank_roots()? {
-        if root == target || !has_bank_files(&root) {
+        if root == target {
             continue;
         }
-        fs::create_dir_all(target).map_err(|err| err.to_string())?;
-        for entry in fs::read_dir(&root).map_err(|err| err.to_string())? {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        let mut ensured_target = false;
+        for entry in entries {
             let entry = entry.map_err(|err| err.to_string())?;
             let source = entry.path();
             let is_bank_asset = is_supported_sqlite(&source)
@@ -429,11 +449,15 @@ fn migrate_question_bank_files(target: &Path) -> Result<(), String> {
                 continue;
             };
             let destination = target.join(file_name);
-            if !destination.exists() {
-                fs::copy(&source, &destination).map_err(|err| err.to_string())?;
+            if destination.exists() {
+                continue;
             }
+            if !ensured_target {
+                fs::create_dir_all(target).map_err(|err| err.to_string())?;
+                ensured_target = true;
+            }
+            fs::copy(&source, &destination).map_err(|err| err.to_string())?;
         }
-        break;
     }
     Ok(())
 }
@@ -1560,18 +1584,26 @@ fn render_pdf_page_native(pdf_path: &Path, page: i64, output_path: &Path) -> Res
 }
 
 fn bind_pdfium_safely() -> Result<Pdfium, String> {
+    let lib_name = Pdfium::pdfium_platform_library_name();
     let mut candidates = Vec::new();
     if let Some(dir) = exe_dir() {
+        // 1) Same dir as the executable (Windows portable layout, dev cargo target).
         candidates.push(Pdfium::pdfium_platform_library_name_at_path(&dir));
-        candidates.push(dir.join("resources").join(Pdfium::pdfium_platform_library_name()));
+        // 2) <exe_dir>/resources/<lib>  (Windows MSI/NSIS install layout)
+        candidates.push(dir.join("resources").join(&lib_name));
+        // 3) macOS .app bundle: exe sits in <App>.app/Contents/MacOS,
+        //    resources land at <App>.app/Contents/Resources/resources/<lib>
         if let Some(parent) = dir.parent() {
-            candidates.push(parent.join("resources").join(Pdfium::pdfium_platform_library_name()));
+            candidates.push(parent.join("Resources").join("resources").join(&lib_name));
+            candidates.push(parent.join("Resources").join(&lib_name));
+            // 4) Fallback for any layout that uses lowercase `resources`.
+            candidates.push(parent.join("resources").join(&lib_name));
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(Pdfium::pdfium_platform_library_name_at_path(&cwd));
-        candidates.push(cwd.join("resources").join(Pdfium::pdfium_platform_library_name()));
-        candidates.push(cwd.join("src-tauri").join("resources").join(Pdfium::pdfium_platform_library_name()));
+        candidates.push(cwd.join("resources").join(&lib_name));
+        candidates.push(cwd.join("src-tauri").join("resources").join(&lib_name));
     }
 
     let mut errors = Vec::new();

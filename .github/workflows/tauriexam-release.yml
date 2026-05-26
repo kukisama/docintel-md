@@ -1,0 +1,158 @@
+name: TauriExam Release
+
+on:
+  workflow_dispatch:
+  watch:
+    types:
+      - started
+
+permissions:
+  contents: write
+
+env:
+  # pdfium-binaries release tag — pin to a known good version
+  # https://github.com/bblanchon/pdfium-binaries/releases
+  PDFIUM_RELEASE: chromium/7857
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || github.event.sender.login == github.repository_owner
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+            rust_target: x86_64-pc-windows-msvc
+            pdfium_asset: pdfium-win-x64.tgz
+            pdfium_lib_name: pdfium.dll
+            bundle_glob: |
+              TauriExam/src-tauri/target/release/bundle/msi/*.msi
+              TauriExam/src-tauri/target/release/bundle/nsis/*.exe
+          - os: macos-14
+            label: macos-arm64
+            rust_target: aarch64-apple-darwin
+            pdfium_asset: pdfium-mac-arm64.tgz
+            pdfium_lib_name: libpdfium.dylib
+            bundle_glob: |
+              TauriExam/src-tauri/target/release/bundle/dmg/*.dmg
+              TauriExam/src-tauri/target/release/bundle/macos/*.app.tar.gz
+          - os: macos-13
+            label: macos-x64
+            rust_target: x86_64-apple-darwin
+            pdfium_asset: pdfium-mac-x64.tgz
+            pdfium_lib_name: libpdfium.dylib
+            bundle_glob: |
+              TauriExam/src-tauri/target/release/bundle/dmg/*.dmg
+              TauriExam/src-tauri/target/release/bundle/macos/*.app.tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: TauriExam/package-lock.json
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: TauriExam/src-tauri -> target
+
+      # macOS-only: install create-dmg and ensure Xcode CLT (runners already have it)
+      # No extra Linux deps needed since we don't target Linux here.
+
+      - name: Download pdfium binary
+        shell: bash
+        env:
+          ASSET: ${{ matrix.pdfium_asset }}
+          LIB_NAME: ${{ matrix.pdfium_lib_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p TauriExam/src-tauri/resources
+          mkdir -p pdfium-download
+          curl -fL -o "pdfium-download/${ASSET}" \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_RELEASE}/${ASSET}"
+          tar -xzf "pdfium-download/${ASSET}" -C pdfium-download
+          # Library may live in lib/ (macOS, Linux) or bin/ (Windows DLL).
+          if [ -f "pdfium-download/lib/${LIB_NAME}" ]; then
+            cp "pdfium-download/lib/${LIB_NAME}" "TauriExam/src-tauri/resources/${LIB_NAME}"
+          elif [ -f "pdfium-download/bin/${LIB_NAME}" ]; then
+            cp "pdfium-download/bin/${LIB_NAME}" "TauriExam/src-tauri/resources/${LIB_NAME}"
+          else
+            echo "::error::Could not locate ${LIB_NAME} inside ${ASSET}. Contents:"
+            find pdfium-download -maxdepth 3 -type f
+            exit 1
+          fi
+          ls -la TauriExam/src-tauri/resources
+
+      - name: Install npm dependencies
+        working-directory: TauriExam
+        run: npm ci
+
+      - name: Build Tauri app
+        working-directory: TauriExam
+        env:
+          # Help pdfium-render find the dylib at runtime during any build-time checks
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/TauriExam/src-tauri/resources
+        run: npm run tauri build -- --target ${{ matrix.rust_target }}
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          target_dir="TauriExam/src-tauri/target/${{ matrix.rust_target }}/release/bundle"
+          if [ -d "$target_dir" ]; then
+            find "$target_dir" \( -name '*.msi' -o -name '*-setup.exe' -o -name '*.dmg' -o -name '*.app.tar.gz' \) -print -exec cp {} staging/ \;
+          fi
+          ls -la staging
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TauriExam-${{ matrix.label }}
+          path: staging/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'workflow_dispatch' || github.event.sender.login == github.repository_owner
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: tauriexam-v0.1.${{ github.run_number }}
+      RELEASE_NAME: TauriExam v0.1.${{ github.run_number }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.msi' -o -name '*-setup.exe' -o -name '*.dmg' -o -name '*.app.tar.gz' \) \
+            -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            release-assets/* \
+            --repo "${{ github.repository }}" \
+            --title "$RELEASE_NAME" \
+            --notes "TauriExam 多平台自动构建（Windows MSI/NSIS + macOS DMG arm64 & x64）。"

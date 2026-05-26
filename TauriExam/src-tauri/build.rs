@@ -8,7 +8,14 @@ fn copy_pdfium_to_target_dirs() {
         Ok(value) => std::path::PathBuf::from(value),
         Err(_) => return,
     };
-    let source = manifest_dir.join("resources").join("pdfium.dll");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let lib_name = match target_os.as_str() {
+        "windows" => "pdfium.dll",
+        "macos" => "libpdfium.dylib",
+        "linux" => "libpdfium.so",
+        _ => return,
+    };
+    let source = manifest_dir.join("resources").join(lib_name);
     if !source.exists() {
         return;
     }
@@ -20,7 +27,7 @@ fn copy_pdfium_to_target_dirs() {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     for ancestor in out_dir.ancestors() {
         if ancestor.file_name().and_then(|name| name.to_str()) == Some(profile.as_str()) {
-            let _ = std::fs::copy(&source, ancestor.join("pdfium.dll"));
+            let _ = std::fs::copy(&source, ancestor.join(lib_name));
             break;
         }
     }
