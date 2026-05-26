@@ -1,0 +1,53 @@
+# ===== build / runtime =====
+target/
+output/
+node_modules/
+dist/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+Thumbs.db
+
+# ===== secrets =====
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+secrets/
+credentials/
+
+# ===== Markdown 默认隐私（设计/编码过程文档） =====
+# 仅放行项目对外说明 README，其它所有 md 都不入库。
+*.md
+!README.md
+!TauriExam/README.md
+
+# ===== 题库内容（受版权保护，整目录 + 所有数据格式都不入仓） =====
+question-banks/
+**/question-banks/
+*.sql
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.wal
+*.shm
+*.pdf
+
+# ===== 本地个人 copilot / agent 配置 =====
+.github/skills/
+
+# ===== 题库流水线脚本 / 提示词工程产物（不公开） =====
+*.ps1
+*.sh
+*.py
+scripts/
