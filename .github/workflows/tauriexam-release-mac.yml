@@ -1,0 +1,160 @@
+name: TauriExam Release (macOS)
+
+# 仅手动触发，避免不必要的 mac runner 占用。
+# 输入控制是否同时打 Intel 版本与是否合并到现有 Release。
+on:
+  workflow_dispatch:
+    inputs:
+      include_intel:
+        description: '同时构建 macOS Intel (x64) 版本'
+        type: boolean
+        default: true
+      attach_to_run_number:
+        description: '附加到已有的 Windows Release 标签（如 tauriexam-v0.1.42），留空则新建独立 mac Release'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  PDFIUM_RELEASE: chromium/7857
+
+jobs:
+  build-mac:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macos-arm64
+            rust_target: aarch64-apple-darwin
+            pdfium_asset: pdfium-mac-arm64.tgz
+            enabled: true
+          - os: macos-13
+            label: macos-x64
+            rust_target: x86_64-apple-darwin
+            pdfium_asset: pdfium-mac-x64.tgz
+            enabled: ${{ inputs.include_intel }}
+
+    steps:
+      - name: Skip if disabled
+        if: ${{ matrix.enabled != true }}
+        run: |
+          echo "Skipping ${{ matrix.label }} (include_intel=false)"
+          exit 0
+
+      - name: Checkout repository
+        if: ${{ matrix.enabled == true }}
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ matrix.enabled == true }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: TauriExam/package-lock.json
+
+      - name: Setup Rust toolchain
+        if: ${{ matrix.enabled == true }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo registry & target
+        if: ${{ matrix.enabled == true }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: TauriExam/src-tauri -> target
+
+      - name: Download pdfium binary
+        if: ${{ matrix.enabled == true }}
+        run: |
+          set -euo pipefail
+          mkdir -p TauriExam/src-tauri/resources
+          mkdir -p pdfium-download
+          curl -fL -o "pdfium-download/${{ matrix.pdfium_asset }}" \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_RELEASE}/${{ matrix.pdfium_asset }}"
+          tar -xzf "pdfium-download/${{ matrix.pdfium_asset }}" -C pdfium-download
+          if [ -f pdfium-download/lib/libpdfium.dylib ]; then
+            cp pdfium-download/lib/libpdfium.dylib TauriExam/src-tauri/resources/libpdfium.dylib
+          else
+            echo "::error::libpdfium.dylib not found in tarball."
+            find pdfium-download -maxdepth 3 -type f
+            exit 1
+          fi
+          ls -la TauriExam/src-tauri/resources
+
+      - name: Install npm dependencies
+        if: ${{ matrix.enabled == true }}
+        working-directory: TauriExam
+        run: npm ci
+
+      - name: Build Tauri app
+        if: ${{ matrix.enabled == true }}
+        working-directory: TauriExam
+        env:
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/TauriExam/src-tauri/resources
+        run: npm run tauri build -- --target ${{ matrix.rust_target }}
+
+      - name: Stage release assets
+        if: ${{ matrix.enabled == true }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          find TauriExam/src-tauri/target/${{ matrix.rust_target }}/release/bundle \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' \) -print -exec cp {} staging/ \;
+          ls -la staging
+
+      - name: Upload build artifacts
+        if: ${{ matrix.enabled == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: TauriExam-${{ matrix.label }}
+          path: staging/*
+          if-no-files-found: error
+
+  release:
+    name: Publish mac Release
+    needs: build-mac
+    runs-on: ubuntu-latest
+    env:
+      DEFAULT_TAG: tauriexam-mac-v0.1.${{ github.run_number }}
+      DEFAULT_NAME: TauriExam macOS v0.1.${{ github.run_number }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.dmg' -o -name '*.app.tar.gz' \) \
+            -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTACH_TO: ${{ inputs.attach_to_run_number }}
+          INCLUDE_INTEL: ${{ inputs.include_intel }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ATTACH_TO" ]; then
+            TAG="$ATTACH_TO"
+            echo "Appending mac assets to existing release: $TAG"
+            gh release upload "$TAG" release-assets/* \
+              --repo "${{ github.repository }}" --clobber
+          else
+            TAG="$DEFAULT_TAG"
+            echo "Creating new mac release: $TAG"
+            gh release create "$TAG" release-assets/* \
+              --repo "${{ github.repository }}" \
+              --title "$DEFAULT_NAME" \
+              --notes "TauriExam macOS 自动构建（Apple Silicon DMG${INCLUDE_INTEL:+ + Intel DMG}）。"
+          fi
