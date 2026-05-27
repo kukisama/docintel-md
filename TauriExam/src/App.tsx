@@ -851,6 +851,15 @@ function App() {
                     onOptionSelect={toggleChoice}
                     onDragAnswerChange={updateDragAnswer}
                     onHotspotAnswerChange={updateHotspotAnswer}
+                    onSubmit={
+                      isStructuredDrag
+                        ? (currentDragComplete ? () => submitExamAnswer() : undefined)
+                        : isStructuredHotspot
+                        ? (currentHotspotComplete ? () => submitExamAnswer() : undefined)
+                        : detail.options.length > 0
+                        ? (exam.selected.length > 0 ? () => submitExamAnswer() : undefined)
+                        : undefined
+                    }
                   />
                   {isCurrentDragLike && !interaction ? (
                     <div className="choice-bar">

@@ -4,9 +4,12 @@ import remarkGfm from 'remark-gfm';
 import { ArrowDown, ArrowUp, ChevronsLeft, ChevronsRight, Star } from 'lucide-react';
 import type { DragDropUserAnswer, HotspotUserAnswer, InteractionModel, PageImage, QuestionDetail, TranslationRow } from './types';
 import type { TranslationMode } from './helpers';
-import { expectedLetters, optionClassName, shouldShowInteraction, createTranslationMap, translatedNode } from './helpers';
+import { expectedLetters, optionClassName, sameSet, shouldShowInteraction, createTranslationMap, translatedNode } from './helpers';
 import DragDropQuestion, { createEmptyDragAnswer, gradeDragDrop, isDragDropComplete, parseDragAnswer } from './DragDropQuestion';
 import HotspotQuestion, { createEmptyHotspotAnswer, gradeHotspot, isHotspotComplete, parseHotspotAnswer } from './HotspotQuestion';
+
+// 选项快捷键白名单：需要时手动扩展。只有列表中的字母才会被拦截为选项快捷键。
+const OPTION_HOTKEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G'] as const;
 
 function TranslationPanel(props: {
   rows: TranslationRow[];
@@ -226,14 +229,90 @@ export default function QuestionPanel(props: {
   onTogglePages: () => void;
   onPrev?: () => void;
   onNext?: () => void;
+  onSubmit?: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const { detail } = props;
+  const questionType = (detail?.question_type || '').toLowerCase();
+  const isSingleChoice = questionType.includes('single_choice');
+  const isMultipleChoice = questionType.includes('multiple_choice');
+  const choicePracticeMode = Boolean(
+    detail &&
+      !props.compact &&
+      !props.onOptionSelect &&
+      !props.historyUserAnswer &&
+      detail.options.length > 0 &&
+      (isSingleChoice || isMultipleChoice),
+  );
+  const [practiceSelected, setPracticeSelected] = useState<string[]>([]);
+  const [practiceChecked, setPracticeChecked] = useState(false);
+  useEffect(() => {
+    setPracticeSelected([]);
+    setPracticeChecked(false);
+  }, [detail?.id]);
+  const togglePracticeOption = (key: string) => {
+    setPracticeChecked(false);
+    setPracticeSelected((prev) => {
+      if (isSingleChoice) return prev[0] === key ? [] : [key];
+      return prev.includes(key) ? prev.filter((item) => item !== key) : [...prev, key];
+    });
+  };
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || target?.isContentEditable) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === 'ArrowLeft' && props.onPrev) {
+        event.preventDefault();
+        props.onPrev();
+        return;
+      }
+      if (event.key === 'ArrowRight' && props.onNext) {
+        event.preventDefault();
+        props.onNext();
+        return;
+      }
+      const examChoiceMode = Boolean(props.onOptionSelect) && (isSingleChoice || isMultipleChoice);
+      if ((choicePracticeMode || examChoiceMode) && detail && event.key.length === 1) {
+        const key = event.key.toUpperCase();
+        if ((OPTION_HOTKEYS as readonly string[]).includes(key)) {
+          const match = detail.options.find((option) => option.option_key.toUpperCase() === key);
+          if (match) {
+            event.preventDefault();
+            if (choicePracticeMode) togglePracticeOption(match.option_key);
+            else props.onOptionSelect?.(match.option_key);
+            return;
+          }
+        }
+      }
+      if (event.key === 'Enter') {
+        if (choicePracticeMode) {
+          if (practiceSelected.length > 0) {
+            event.preventDefault();
+            setPracticeChecked(true);
+          }
+          return;
+        }
+        if (props.onSubmit) {
+          event.preventDefault();
+          props.onSubmit();
+        }
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [props.onPrev, props.onNext, props.onSubmit, props.onOptionSelect, choicePracticeMode, isSingleChoice, isMultipleChoice, detail?.id, practiceSelected]);
   if (!detail) return <div className="panel empty-state">请选择一道题。</div>;
   const expected = expectedLetters(detail.recommended_answer || '');
   const translationMap = createTranslationMap(props.translations || []);
   const translationMode = props.translationMode || 'original';
-  const interactiveOptions = Boolean(props.onOptionSelect);
+  const externalSelected = props.selectedOptions ?? [];
+  const optionSelected = choicePracticeMode ? practiceSelected : externalSelected;
+  const optionOnSelect = choicePracticeMode ? togglePracticeOption : props.onOptionSelect;
+  const interactiveOptions = Boolean(optionOnSelect);
+  const optionShowAnswer = props.showAnswer || (choicePracticeMode && practiceChecked);
+  const practiceCorrect = choicePracticeMode && practiceChecked ? sameSet(practiceSelected, expected) : null;
   const isStructuredDrag = props.interaction?.kind === 'drag_drop' && props.interaction.slots.length > 0;
   const isStructuredHotspot = props.interaction?.kind === 'hotspot' && props.interaction.rows.length > 0 && props.interaction.options.length > 0;
   const scrollPanel = (position: 'top' | 'bottom') => {
@@ -241,8 +320,30 @@ export default function QuestionPanel(props: {
     if (!element) return;
     element.scrollTo({ top: position === 'top' ? 0 : element.scrollHeight, behavior: 'smooth' });
   };
+  const optionLetters = detail.options
+    .map((option) => option.option_key.toUpperCase())
+    .filter((k) => (OPTION_HOTKEYS as readonly string[]).includes(k));
+  const letterRange = optionLetters.length === 0
+    ? ''
+    : optionLetters.length <= 4
+    ? optionLetters.join('/')
+    : `${optionLetters[0]}-${optionLetters[optionLetters.length - 1]}`;
+  const hotkeyHints: string[] = [];
+  if (choicePracticeMode) {
+    if (letterRange) hotkeyHints.push(`${letterRange} ${isMultipleChoice ? '切换' : '选择'}选项`);
+    hotkeyHints.push('Enter 检查答案');
+  } else if (props.onOptionSelect && (isSingleChoice || isMultipleChoice)) {
+    if (letterRange) hotkeyHints.push(`${letterRange} ${isMultipleChoice ? '切换' : '选择'}选项`);
+    if (props.onSubmit) hotkeyHints.push('Enter 提交本题');
+  } else if (props.onSubmit) {
+    hotkeyHints.push('Enter 提交本题');
+  }
+  if (props.onPrev || props.onNext) hotkeyHints.push('← → 上一题/下一题');
   return (
     <div ref={panelRef} className={props.compact ? 'question-detail compact' : 'panel question-detail'}>
+      {hotkeyHints.length > 0 && (
+        <div className="hotkey-hint">⌨ {hotkeyHints.join(' · ')}</div>
+      )}
       <div className="detail-title">
         <div>
           <span className="eyebrow">Question {detail.sequence_number}</span>
@@ -303,20 +404,30 @@ export default function QuestionPanel(props: {
             {detail.options.map((option) => (
               <button
                 className={optionClassName({
-                  showAnswer: props.showAnswer,
+                  showAnswer: optionShowAnswer,
                   isCorrect: expected.includes(option.option_key),
-                  isSelected: props.selectedOptions?.includes(option.option_key) ?? false,
+                  isSelected: optionSelected.includes(option.option_key),
                   interactive: interactiveOptions,
                 })}
                 key={option.option_key}
                 disabled={!interactiveOptions}
-                onClick={() => props.onOptionSelect?.(option.option_key)}
+                onClick={() => optionOnSelect?.(option.option_key)}
               >
                 <strong>{option.option_key}</strong>
                 <span>{translatedNode(`option:${option.option_key}`, option.option_text, translationMode, translationMap)}</span>
               </button>
             ))}
           </div>
+          {choicePracticeMode && (
+            <div className="drag-practice-actions">
+              <button className="primary" disabled={practiceSelected.length === 0} onClick={() => setPracticeChecked(true)}>
+                检查答案
+              </button>
+              <button onClick={() => { setPracticeSelected([]); setPracticeChecked(false); }}>重做</button>
+              {practiceCorrect === true && <span className="result correct">回答正确</span>}
+              {practiceCorrect === false && <span className="result wrong">回答错误，正确答案：{expected.join(', ') || '—'}</span>}
+            </div>
+          )}
         </section>
       )}
 
