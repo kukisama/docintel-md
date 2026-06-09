@@ -10,6 +10,11 @@ import type {
   BatchTranslateResult,
   BankHealth,
   BankInfo,
+  DeckEvents,
+  DeckPing,
+  DeckSession,
+  DeckSettings,
+  DeckSlotInput,
   ExamAnswerDetail,
   ExamSessionSummary,
   PageImage,
@@ -71,4 +76,18 @@ export const api = {
   listExamAnswers: (sessionId: string) => invoke<ExamAnswerDetail[]>('list_exam_answers', { sessionId }),
   getQuestionPracticeStats: (bankId: string, questionIds: string[]) =>
     invoke<QuestionPracticeStats[]>('get_question_practice_stats', { bankId, questionIds }),
+
+  // —— 设备插件（opendecknew）。后端 deck 模块；设备不存在时这些调用静默失败由调用方吞掉 ——
+  deckGetSettings: () => invoke<DeckSettings>('deck_get_settings'),
+  deckSaveSettings: (settings: DeckSettings) => invoke<DeckSettings>('deck_save_settings', { settings }),
+  deckPing: () => invoke<DeckPing>('deck_ping'),
+  deckTakeover: () => invoke<DeckSession>('deck_takeover'),
+  deckHeartbeat: (epoch: number) => invoke<void>('deck_heartbeat', { epoch }),
+  deckPushSlots: (epoch: number, clearFirst: boolean, slots: DeckSlotInput[]) =>
+    invoke<void>('deck_push_slots', { epoch, clearFirst, slots }),
+  deckSetBrightness: (epoch: number, brightness: number) =>
+    invoke<void>('deck_set_brightness', { epoch, brightness }),
+  deckHostBrightness: () => invoke<number | null>('deck_host_brightness'),
+  deckPollEvents: (epoch: number, after: number) => invoke<DeckEvents>('deck_poll_events', { epoch, after }),
+  deckRelease: (epoch: number) => invoke<void>('deck_release', { epoch }),
 };

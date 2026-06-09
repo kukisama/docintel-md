@@ -1,7 +1,14 @@
 import { useEffect, useState } from 'react';
-import { BookOpen, FolderOpen, RefreshCw, Settings, ShieldCheck } from 'lucide-react';
-import type { AiSettings, AppPaths, BatchTranslateEvent, BankHealth, BankInfo } from './types';
+import { BookOpen, FolderOpen, Gamepad2, RefreshCw, Settings, ShieldCheck } from 'lucide-react';
+import type { AiSettings, AppPaths, BatchTranslateEvent, BankHealth, BankInfo, DeckPing, DeckSettings } from './types';
 import { Stat } from './QuestionList';
+
+const DEFAULT_DECK_SETTINGS: DeckSettings = {
+  enabled: false,
+  base_url: 'http://127.0.0.1:57200/api/v1',
+  token: '',
+  brightness: 50,
+};
 
 export default function SettingsPanel(props: {
   appPaths: AppPaths | null;
@@ -9,6 +16,7 @@ export default function SettingsPanel(props: {
   bankId: string;
   bankHealth: BankHealth | null;
   aiSettings: AiSettings | null;
+  deckSettings: DeckSettings | null;
   message: string;
   batchTranslation: BatchTranslateEvent | null;
   batchTranslationBusy: boolean;
@@ -19,9 +27,11 @@ export default function SettingsPanel(props: {
   onSaveAiSettings: (settings: AiSettings) => void;
   onTestTranslatorSettings: (settings: AiSettings) => void;
   onBatchTranslate: () => void;
+  onSaveDeckSettings: (settings: DeckSettings) => void;
+  onTestDeckConnection: () => Promise<DeckPing>;
 }) {
   const currentBank = props.banks.find((bank) => bank.id === props.bankId);
-  const [tab, setTab] = useState<'files' | 'ai' | 'translation'>('files');
+  const [tab, setTab] = useState<'files' | 'ai' | 'translation' | 'device'>('files');
   const [draft, setDraft] = useState<AiSettings>(
     props.aiSettings || {
       enabled: false,
@@ -44,6 +54,25 @@ export default function SettingsPanel(props: {
     if (props.aiSettings) setDraft(props.aiSettings);
   }, [props.aiSettings]);
 
+  const [deckDraft, setDeckDraft] = useState<DeckSettings>(props.deckSettings || DEFAULT_DECK_SETTINGS);
+  const [deckProbe, setDeckProbe] = useState<DeckPing | null>(null);
+  const [deckProbing, setDeckProbing] = useState(false);
+
+  useEffect(() => {
+    if (props.deckSettings) setDeckDraft(props.deckSettings);
+  }, [props.deckSettings]);
+
+  async function probeDeck() {
+    setDeckProbing(true);
+    try {
+      setDeckProbe(await props.onTestDeckConnection());
+    } catch {
+      setDeckProbe({ reachable: false, enabled: false, device_id: null });
+    } finally {
+      setDeckProbing(false);
+    }
+  }
+
   const batchProgressPercent = props.batchTranslation?.total
     ? Math.round((props.batchTranslation.current_index / props.batchTranslation.total) * 100)
     : 0;
@@ -59,6 +88,9 @@ export default function SettingsPanel(props: {
         </button>
         <button className={tab === 'translation' ? 'active' : ''} onClick={() => setTab('translation')}>
           <BookOpen size={16} /> 翻译服务
+        </button>
+        <button className={tab === 'device' ? 'active' : ''} onClick={() => setTab('device')}>
+          <Gamepad2 size={16} /> 设备
         </button>
       </div>
 
@@ -289,6 +321,90 @@ export default function SettingsPanel(props: {
               </div>
             ) : (
               <div className="empty-state small">点击按钮后显示进度</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === 'device' && (
+        <div className="settings-tab-body">
+          <div className="panel settings-card">
+            <div className="settings-head">
+              <h3>外接设备（StreamDock / AKP153）</h3>
+              <label className="switch-label">
+                <input
+                  type="checkbox"
+                  checked={deckDraft.enabled}
+                  onChange={(e) => setDeckDraft({ ...deckDraft, enabled: e.target.checked })}
+                />
+                启用设备支持
+              </label>
+            </div>
+            <p className="muted">
+              检测到本机运行 opendecknew 时，考试中会把当前题投到设备，按设备键即可选答 / 提交。未检测到设备时不影响任何功能。
+            </p>
+            <table className="file-table">
+              <tbody>
+                <tr>
+                  <td className="ft-label">接口地址</td>
+                  <td>
+                    <input
+                      className="text-input"
+                      value={deckDraft.base_url}
+                      placeholder="http://127.0.0.1:57200/api/v1"
+                      onChange={(e) => setDeckDraft({ ...deckDraft, base_url: e.target.value })}
+                    />
+                  </td>
+                </tr>
+                <tr>
+                  <td className="ft-label">令牌 Token</td>
+                  <td>
+                    <input
+                      className="text-input"
+                      type="password"
+                      value={deckDraft.token}
+                      placeholder="从 opendecknew 设置页复制"
+                      onChange={(e) => setDeckDraft({ ...deckDraft, token: e.target.value })}
+                    />
+                  </td>
+                </tr>
+                <tr>
+                  <td className="ft-label">亮度 0-100</td>
+                  <td>
+                    <input
+                      className="text-input"
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={deckDraft.brightness}
+                      placeholder="DeckHelper 默认 50"
+                      onChange={(e) =>
+                        setDeckDraft({
+                          ...deckDraft,
+                          brightness: Math.max(0, Math.min(100, Math.round(Number(e.target.value) || 0))),
+                        })
+                      }
+                    />
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div className="action-row compact-actions">
+              <button className="primary" onClick={() => props.onSaveDeckSettings(deckDraft)}>
+                保存
+              </button>
+              <button onClick={probeDeck} disabled={deckProbing}>
+                {deckProbing ? '检测中...' : '检测设备'}
+              </button>
+            </div>
+            {deckProbe && (
+              <div className={deckProbe.reachable && deckProbe.enabled ? 'info-box ok' : 'info-box'}>
+                {deckProbe.reachable
+                  ? deckProbe.enabled
+                    ? `设备在线：${deckProbe.device_id || '未知型号'}`
+                    : 'opendecknew 在线，但第三方控制能力已关闭（请在其设置页开启）。'
+                  : '未检测到 opendecknew。请确认它已运行，且地址正确。'}
+              </div>
             )}
           </div>
         </div>

@@ -302,3 +302,44 @@ export type ExamAnswerDetail = {
   duration_seconds: number;
   created_at: string;
 };
+
+// —— 设备插件（opendecknew / StreamDock Lite）——
+// 这些类型对应后端 src-tauri/src/deck 模块；设备不存在时整个功能 no-op。
+
+export type DeckSettings = {
+  enabled: boolean;
+  base_url: string;
+  token: string;
+  brightness: number;
+};
+
+export type DeckPing = {
+  reachable: boolean;
+  enabled: boolean;
+  device_id: string | null;
+};
+
+export type DeckSession = {
+  epoch: number;
+  event_seq: number;
+  lease_ms: number;
+};
+
+export type DeckSlotInput = {
+  slot_id: string;
+  title?: string;
+  icon?: string;
+  color?: string;
+  emit_key?: string;
+  clear?: boolean;
+};
+
+export type DeckEvent = {
+  seq: number;
+  slot_id: string;
+};
+
+export type DeckEvents = {
+  events: DeckEvent[];
+  latest_seq: number;
+};

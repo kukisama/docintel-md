@@ -17,6 +17,8 @@ import type {
   BatchTranslateEvent,
   BankHealth,
   BankInfo,
+  DeckPing,
+  DeckSettings,
   DragDropUserAnswer,
   HotspotUserAnswer,
   ExamAnswerDetail,
@@ -38,6 +40,7 @@ import QuestionList, { ReviewList, Stat } from './QuestionList';
 import SettingsPanel from './SettingsPanel';
 import { createCorrectDragAnswer, describeDragAnswer, gradeDragDrop, isDragDropComplete, normalizeDragAnswer } from './DragDropQuestion';
 import { createCorrectHotspotAnswer, describeHotspotAnswer, gradeHotspot, isHotspotComplete, normalizeHotspotAnswer } from './HotspotQuestion';
+import { useExamDeck } from './deck';
 
 type View = 'browse' | 'exam' | 'history' | 'review' | 'settings';
 type Theme = 'light' | 'dark';
@@ -96,7 +99,7 @@ function App() {
   const [returnContext, setReturnContext] = useState<ReturnContext | null>(null);
   const [interaction, setInteraction] = useState<InteractionModel | null>(null);
   const [aiSettings, setAiSettings] = useState<AiSettings | null>(null);
-  const [aiPrompt, setAiPrompt] = useState('');
+  const [deckSettings, setDeckSettings] = useState<DeckSettings | null>(null);  const [aiPrompt, setAiPrompt] = useState('');
   const [aiAnswer, setAiAnswer] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
   const [aiStreamChunkCount, setAiStreamChunkCount] = useState(0);
@@ -109,6 +112,25 @@ function App() {
   const [batchTranslationBusy, setBatchTranslationBusy] = useState(false);
   const [batchTranslation, setBatchTranslation] = useState<BatchTranslateEvent | null>(null);
   const [nowTick, setNowTick] = useState(Date.now());
+
+  // 设备插件（opendecknew）：考试视图下把当前题投到 AKP153，按设备键触发现有热键。
+  // 检测不到设备时整段 no-op，不影响主程序。
+  useExamDeck({
+    active: view === 'exam' && Boolean(exam) && !exam?.finished,
+    detail,
+    selected: exam?.selected ?? [],
+    index: exam?.index ?? 0,
+    total: exam?.questions.length ?? 0,
+    navEnabled: false, // 考试视图未接线 ←/→ 翻题，提交即前进，故不显示翻题键
+    hasPrev: false,
+    hasNext: false,
+    brightness: deckSettings?.brightness ?? 50,
+    // 设备按键 → 直接驱动答题（events 轮询，不依赖键盘注入）。
+    onOption: toggleChoice,
+    onSubmit: () => {
+      if (exam && exam.selected.length > 0) void submitExamAnswer();
+    },
+  });
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -199,6 +221,11 @@ function App() {
       setError('');
       setAppPaths(await api.getAppPaths());
       setAiSettings(await api.getAiSettings());
+      try {
+        setDeckSettings(await api.deckGetSettings());
+      } catch {
+        // 设备设置读取失败不影响主流程。
+      }
       const loadedBanks = await api.listBanks();
       setBanks(loadedBanks);
       if (loadedBanks[0]) setBankId(loadedBanks[0].id);
@@ -398,6 +425,20 @@ function App() {
     } catch (err) {
       setError(String(err));
     }
+  }
+
+  async function saveDeckSettings(next: DeckSettings) {
+    try {
+      setError('');
+      setDeckSettings(await api.deckSaveSettings(next));
+      setSettingsMessage('设备设置已保存。');
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function testDeckConnection(): Promise<DeckPing> {
+    return api.deckPing();
   }
 
   async function testTranslatorSettings(settings: AiSettings) {
@@ -1030,6 +1071,7 @@ function App() {
             bankId={bankId}
             bankHealth={bankHealth}
             aiSettings={aiSettings}
+            deckSettings={deckSettings}
             message={settingsMessage}
             batchTranslation={batchTranslation}
             batchTranslationBusy={batchTranslationBusy}
@@ -1040,6 +1082,8 @@ function App() {
             onSaveAiSettings={saveAiSettings}
             onTestTranslatorSettings={testTranslatorSettings}
             onBatchTranslate={batchTranslateCurrentBank}
+            onSaveDeckSettings={saveDeckSettings}
+            onTestDeckConnection={testDeckConnection}
           />
         )}
       </main>

@@ -17,6 +17,8 @@ use std::time::Duration;
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
+mod deck;
+
 const APP_DIR_NAME: &str = "TauriExam";
 static PDF_RENDER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -545,7 +547,7 @@ fn hash_text(value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+pub(crate) fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
     conn.query_row("SELECT value FROM app_settings WHERE key = ?1", params![key], |row| row.get(0))
         .map(Some)
         .or_else(|err| {
@@ -557,7 +559,7 @@ fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
         })
 }
 
-fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+pub(crate) fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
         r#"
@@ -1120,7 +1122,7 @@ fn init_translation_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|err| err.to_string())
 }
 
-fn open_app_db() -> Result<Connection, String> {
+pub(crate) fn open_app_db() -> Result<Connection, String> {
     let path = app_db_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -2929,7 +2931,17 @@ fn main() {
             ask_ai_about_question_stream,
             get_cached_translations,
             translate_question,
-            batch_translate_bank
+            batch_translate_bank,
+            deck::deck_get_settings,
+            deck::deck_save_settings,
+            deck::deck_ping,
+            deck::deck_takeover,
+            deck::deck_heartbeat,
+            deck::deck_push_slots,
+            deck::deck_set_brightness,
+            deck::deck_host_brightness,
+            deck::deck_poll_events,
+            deck::deck_release
         ])
         .run(tauri::generate_context!())
         .expect("error while running TauriExam");
