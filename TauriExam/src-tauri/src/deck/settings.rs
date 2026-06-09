@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::{get_setting, open_app_db, set_setting};
+use crate::storage::{get_setting, open_app_db, set_setting};
 
 use super::types::DeckSettings;
 
